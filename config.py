@@ -22,7 +22,7 @@ from datetime import datetime
 # =============================================================================
 EXP_NAME = "DAEAC_baseline"
 SEED = 1234
-DEVICE = "auto"  # "auto", "cuda", "cpu", "cuda:0", etc.
+DEVICE = "cuda"  # "auto", "cuda", "cpu", "cuda:0", etc.
 
 # =============================================================================
 # 2. 경로 설정
