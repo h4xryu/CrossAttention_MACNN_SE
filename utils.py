@@ -258,8 +258,6 @@ def compute_rr_features_opt2(
         pre_rr_ratio,       # [0] pre-RR ratio (global)
         near_pre_rr_ratio,  # [1] near-pre-RR ratio (local, last 10)
     ], axis=1).astype(np.float32)
-    print(pre_rr_ratio)
-    print(pre_rr_ratio.shape)
     
     return all_features
 
@@ -596,10 +594,23 @@ def extract_beats_daeac_style(
 
     print(f"{split_name} (DAEAC style) - Skipped: {skipped_total}, Extracted: {len(all_data)}")
 
+    # Ensure all_rr is properly shaped as (n_samples, 2)
+    # Convert list of 1D arrays to 2D array explicitly
+    if len(all_rr) > 0:
+        rr_array = np.stack(all_rr, axis=0).astype(np.float32)
+    else:
+        rr_array = np.array([], dtype=np.float32).reshape(0, 2)
+    
+    # Validate shape
+    if rr_array.ndim != 2:
+        raise ValueError(f"RR features should be 2D array (n_samples, 2), got {rr_array.ndim}D with shape {rr_array.shape}")
+    if rr_array.shape[1] != 2:
+        raise ValueError(f"RR features should have 2 columns, got shape {rr_array.shape}")
+
     return (
         np.asarray(all_data, dtype=np.float32),
         np.asarray(all_labels, dtype=np.int64),
-        np.asarray(all_rr, dtype=np.float32),
+        rr_array,
         np.asarray(all_pids, dtype=np.int64),
         np.asarray(all_idx, dtype=np.int64),
     )
@@ -722,9 +733,15 @@ def _is_cache_valid(cache_paths: dict, record_list: list, out_len: int) -> bool:
 
         # RR feature dimension 확인
         rr_sample = np.load(cache_paths['rr'], mmap_mode='r')
-        if len(rr_sample) > 0 and rr_sample.shape[1] != meta.get('rr_dim', 7):
-            print(f"  Cache invalid: RR dimension mismatch")
-            return False
+        if len(rr_sample) > 0:
+            # For DAEAC style, rr should be 2D with 2 columns
+            expected_rr_dim = meta.get('rr_dim', 7)
+            if rr_sample.ndim != 2:
+                print(f"  Cache invalid: RR array should be 2D, got {rr_sample.ndim}D")
+                return False
+            if rr_sample.shape[1] != expected_rr_dim:
+                print(f"  Cache invalid: RR dimension mismatch ({rr_sample.shape[1]} vs {expected_rr_dim})")
+                return False
 
         return True
 
@@ -813,6 +830,7 @@ def load_or_extract_data(
         print(f"  Loading from cache...")
         data, labels, rr, patient_ids, sample_ids = _load_cache(cache_paths)
         print(f"  Loaded {len(data)} samples from cache")
+        print(f"  RR features shape: {rr.shape if hasattr(rr, 'shape') else type(rr)}")
         return data, labels, rr, patient_ids, sample_ids
 
     # 캐시 없거나 유효하지 않음 -> 전처리 실행
@@ -839,6 +857,9 @@ def load_or_extract_data(
             n_jobs=n_jobs
         )
 
+    # Debug: Print extracted RR shape
+    print(f"  Extracted RR features shape: {rr.shape if hasattr(rr, 'shape') else type(rr)}")
+    
     # 캐시 저장
     if len(data) > 0:
         rr_dim = rr.shape[1] if len(rr.shape) > 1 else 0

@@ -28,7 +28,7 @@ def train_one_epoch(model: nn.Module, train_loader, num_epoch: int,
     p_t_f_all = []  # F 클래스
 
     for batch in tqdm(train_loader, desc=f"Training Epoch {num_epoch} ", leave=True):
-        ecg_inputs, rr_features, labels, pids, _ = batch
+        ecg_inputs, labels, rr_features, pids, _ = batch
         ecg_inputs = ecg_inputs.to(device)
         rr_features = rr_features.to(device)
         labels = labels.to(device)
@@ -147,7 +147,7 @@ def validate(model: nn.Module, valid_loader, device: torch.device) -> tuple:
     
     with torch.no_grad():
         for batch in valid_loader:
-            ecg_inputs, rr_features, labels, pids, _ = batch
+            ecg_inputs, labels, rr_features, pids, _ = batch
             ecg_inputs = ecg_inputs.to(device)
             rr_features = rr_features.to(device)
             labels = labels.to(device)

@@ -343,7 +343,7 @@ class MultiHeadCrossAttentionFusionBlock(nn.Module):
 #=========================================================================================
 
 class MACNN_SE(nn.Module): 
-    def __init__(self, reduction=16, aspp_bn=True, aspp_act=True, lead=1, p=0.0, 
+    def __init__(self, reduction=16, aspp_bn=True, aspp_act=True, lead=3, p=0.0, 
                  dilations=(1, 6, 12, 18), act_func='tanh', f_act_func='tanh', 
                  apply_residual=False, 
                  fusion_type=None, fusion_emb=64, fusion_expansion=2, rr_dim=7, num_heads=1): 
