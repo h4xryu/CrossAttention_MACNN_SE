@@ -23,11 +23,17 @@ import torch
 from torch.utils.data import DataLoader
 from openpyxl import load_workbook
 
+from tqdm import tqdm
+
 from utils import set_seed, load_or_extract_data
 from model import MACNN_SE
 from dataloader import ECGDataset
 from train import train_one_epoch, validate, save_model
 from evaluate_module import evaluate, calculate_metrics, save_confusion_matrix
+from logger import (
+    TrainingLogger, print_epoch_header, print_per_class_metrics,
+    print_epoch_stats, print_confidence_stats, print_epoch_time
+)
 
 # =============================================================================
 # 설정
@@ -72,6 +78,9 @@ DS2_TEST = [
 
 # 실험할 fusion_type 리스트
 FUSION_TYPES = [None, 'concat', 'concat_proj', 'mhca']
+
+# num_heads 그리드 서치 값 (mhca에서만 사용)
+NUM_HEADS_LIST = [1, 2, 4, 8]
 
 # MACNN_SE 기본 설정 (그리드 서치 결과 또는 기본값 사용)
 DEFAULT_MODEL_CONFIG = {
@@ -206,7 +215,7 @@ class ExcelResultWriter:
 
 def run_single_experiment(fusion_type, exp_name: str, device: torch.device,
                           data_loaders: tuple, excel_writer: ExcelResultWriter,
-                          exp_dir: str):
+                          exp_dir: str, num_heads: int = 1):
     """
     단일 fusion type 실험 수행
 
@@ -217,6 +226,7 @@ def run_single_experiment(fusion_type, exp_name: str, device: torch.device,
         data_loaders: (train_loader, valid_loader, test_loader)
         excel_writer: 엑셀 결과 저장 객체
         exp_dir: 실험 디렉토리
+        num_heads: attention head 수 (mhca에서 사용)
 
     Returns:
         result_dict: 결과 딕셔너리
@@ -224,12 +234,13 @@ def run_single_experiment(fusion_type, exp_name: str, device: torch.device,
     train_loader, valid_loader, test_loader = data_loaders
 
     print(f"\n{'='*80}")
-    print(f"Experiment: {exp_name} (fusion_type={fusion_type})")
+    print(f"Experiment: {exp_name} (fusion_type={fusion_type}, num_heads={num_heads})")
     print(f"{'='*80}")
 
     result_dict = {
         'exp_name': exp_name,
         'fusion_type': fusion_type,
+        'num_heads': num_heads,
         'best_valid_auroc': 0.0,
         'best_valid_auprc': 0.0,
         'test_auroc_metrics': None,
@@ -240,7 +251,7 @@ def run_single_experiment(fusion_type, exp_name: str, device: torch.device,
     try:
         set_seed(SEED)
 
-        # MACNN_SE 모델 생성 - fusion_type만 변경
+        # MACNN_SE 모델 생성 - fusion_type과 num_heads 변경
         model = MACNN_SE(
             reduction=DEFAULT_MODEL_CONFIG['reduction'],
             aspp_bn=DEFAULT_MODEL_CONFIG['aspp_bn'],
@@ -251,11 +262,11 @@ def run_single_experiment(fusion_type, exp_name: str, device: torch.device,
             act_func=DEFAULT_MODEL_CONFIG['act_func'],
             f_act_func=DEFAULT_MODEL_CONFIG['f_act_func'],
             apply_residual=DEFAULT_MODEL_CONFIG['apply_residual'],
-            fusion_type=fusion_type,  # 이것만 변경!
+            fusion_type=fusion_type,
             fusion_emb=DEFAULT_MODEL_CONFIG['fusion_emb'],
             fusion_expansion=DEFAULT_MODEL_CONFIG['fusion_expansion'],
             rr_dim=DEFAULT_MODEL_CONFIG['rr_dim'],
-            num_heads=DEFAULT_MODEL_CONFIG['num_heads']
+            num_heads=num_heads
         ).to(device)
 
         # 파라미터 수 출력
@@ -272,15 +283,28 @@ def run_single_experiment(fusion_type, exp_name: str, device: torch.device,
 
         # 학습 루프
         for epoch in range(1, EPOCHS + 1):
+            current_lr = optimizer.param_groups[0]['lr']
+
             # Train
-            train_loss, train_metrics, *_ = train_one_epoch(
+            train_loss, train_metrics, *p_t_train = train_one_epoch(
                 model, train_loader, POLY1_EPS, POLY2_EPS, optimizer, device
             )
 
+            print_epoch_stats(epoch, train_loss, train_metrics['acc'], current_lr, phase='Train')
+            # print_per_class_metrics(train_metrics, CLASSES, phase='Train')
+            # print_confidence_stats(*p_t_train, phase='Train')
+            logger.log_epoch(epoch, train_loss, train_metrics, phase='train')
+            logger.log_confidence(epoch, *p_t_train, phase='train')
             # Validation
-            valid_loss, valid_metrics, *_ = validate(
+            valid_loss, valid_metrics, *p_t_valid = validate(
                 model, valid_loader, POLY1_EPS, POLY2_EPS, device
             )
+
+            print_epoch_stats(epoch, valid_loss, valid_metrics['acc'], current_lr, phase='Valid')
+            # print_per_class_metrics(valid_metrics, CLASSES, phase='Valid')
+            # print_confidence_stats(*p_t_valid, phase='Valid')
+            logger.log_epoch(epoch, valid_loss, valid_metrics, phase='valid')
+            logger.log_confidence(epoch, *p_t_valid, phase='valid')
 
             # Best AUROC 체크
             if valid_metrics['macro_auroc'] > best_auroc['value']:
@@ -289,7 +313,7 @@ def run_single_experiment(fusion_type, exp_name: str, device: torch.device,
                     'epoch': epoch,
                     'state_dict': copy.deepcopy(model.state_dict())
                 }
-                print(f"  Epoch {epoch}: New best AUROC = {best_auroc['value']:.4f}")
+                print(f"  ★ [BEST AUROC] {best_auroc['value']:.4f}")
 
             # Best AUPRC 체크
             if valid_metrics['macro_auprc'] > best_auprc['value']:
@@ -298,14 +322,10 @@ def run_single_experiment(fusion_type, exp_name: str, device: torch.device,
                     'epoch': epoch,
                     'state_dict': copy.deepcopy(model.state_dict())
                 }
-                print(f"  Epoch {epoch}: New best AUPRC = {best_auprc['value']:.4f}")
-
-            if epoch % 10 == 0:
-                print(f"  Epoch {epoch}/{EPOCHS} - Train Loss: {train_loss:.4f}, "
-                      f"Valid AUROC: {valid_metrics['macro_auroc']:.4f}, "
-                      f"Valid AUPRC: {valid_metrics['macro_auprc']:.4f}")
+                print(f"  ★ [BEST AUPRC] {best_auprc['value']:.4f}")
 
             scheduler.step()
+            print("=" * 120 + "\n")
 
         # =====================================================================
         # Best AUROC 모델로 테스트
@@ -323,6 +343,7 @@ def run_single_experiment(fusion_type, exp_name: str, device: torch.device,
             'model_state_dict': best_auroc['state_dict'],
             'epoch': best_auroc['epoch'],
             'fusion_type': fusion_type,
+            'num_heads': num_heads,
             'auroc': best_auroc['value']
         }, auroc_path)
 
@@ -353,6 +374,7 @@ def run_single_experiment(fusion_type, exp_name: str, device: torch.device,
             'model_state_dict': best_auprc['state_dict'],
             'epoch': best_auprc['epoch'],
             'fusion_type': fusion_type,
+            'num_heads': num_heads,
             'auprc': best_auprc['value']
         }, auprc_path)
 
@@ -379,7 +401,7 @@ def run_single_experiment(fusion_type, exp_name: str, device: torch.device,
         import traceback
         traceback.print_exc()
         result_dict['status'] = 'error'
-
+   
     return result_dict
 
 
@@ -411,6 +433,7 @@ def run_auto_experiments():
 
     print(f"\nOutput: {exp_dir}")
     print(f"Fusion types to test: {FUSION_TYPES}")
+    print(f"num_heads grid search (for mhca): {NUM_HEADS_LIST}")
     print(f"Default config: {DEFAULT_MODEL_CONFIG}")
     print(f"{'='*80}")
 
@@ -452,17 +475,34 @@ def run_auto_experiments():
     total_start = time.time()
 
     for fusion_type in FUSION_TYPES:
-        exp_name = FUSION_TYPE_NAMES[fusion_type]
+        base_exp_name = FUSION_TYPE_NAMES[fusion_type]
 
-        result = run_single_experiment(
-            fusion_type=fusion_type,
-            exp_name=exp_name,
-            device=device,
-            data_loaders=data_loaders,
-            excel_writer=excel_writer,
-            exp_dir=exp_dir
-        )
-        results_list.append(result)
+        # mhca의 경우 num_heads 그리드 서치 수행
+        if fusion_type == 'mhca':
+            for num_heads in NUM_HEADS_LIST:
+                exp_name = f"{base_exp_name}_h{num_heads}"
+                result = run_single_experiment(
+                    fusion_type=fusion_type,
+                    exp_name=exp_name,
+                    device=device,
+                    data_loaders=data_loaders,
+                    excel_writer=excel_writer,
+                    exp_dir=exp_dir,
+                    num_heads=num_heads
+                )
+                results_list.append(result)
+        else:
+            # 다른 fusion type은 기본 num_heads=1 사용
+            result = run_single_experiment(
+                fusion_type=fusion_type,
+                exp_name=base_exp_name,
+                device=device,
+                data_loaders=data_loaders,
+                excel_writer=excel_writer,
+                exp_dir=exp_dir,
+                num_heads=1
+            )
+            results_list.append(result)
 
     # 최종 요약
     total_time = (time.time() - total_start) / 60
@@ -474,18 +514,21 @@ def run_auto_experiments():
     print(f"Total time: {total_time:.1f} min")
     print(f"Successful experiments: {len(successful)}/{len(FUSION_TYPES)}")
 
+    # 총 실험 수 계산
+    total_experiments = len(FUSION_TYPES) - 1 + len(NUM_HEADS_LIST)  # mhca 제외한 fusion types + mhca * num_heads
+
     print(f"\nResults Summary:")
-    print(f"{'Fusion Type':<15} {'Valid AUROC':<12} {'Valid AUPRC':<12} {'Test F1 (AUROC)':<15} {'Test F1 (AUPRC)':<15}")
-    print("-" * 70)
+    print(f"{'Experiment':<20} {'num_heads':<10} {'Valid AUROC':<12} {'Valid AUPRC':<12} {'Test F1 (AUROC)':<15} {'Test F1 (AUPRC)':<15}")
+    print("-" * 85)
 
     for result in results_list:
         if result['status'] == 'success':
             auroc_f1 = result['test_auroc_metrics']['macro_f1']
             auprc_f1 = result['test_auprc_metrics']['macro_f1']
-            print(f"{result['exp_name']:<15} {result['best_valid_auroc']:<12.4f} "
+            print(f"{result['exp_name']:<20} {result['num_heads']:<10} {result['best_valid_auroc']:<12.4f} "
                   f"{result['best_valid_auprc']:<12.4f} {auroc_f1:<15.4f} {auprc_f1:<15.4f}")
         else:
-            print(f"{result['exp_name']:<15} FAILED")
+            print(f"{result['exp_name']:<20} FAILED")
 
     print(f"\nResults saved to: {output_xlsx}")
     print(f"{'='*80}")

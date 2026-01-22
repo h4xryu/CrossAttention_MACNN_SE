@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
 def _get_act_func(act_func, in_channels):
     if act_func == 'tanh':
         return nn.Tanh()
@@ -18,89 +20,10 @@ def _get_act_func(act_func, in_channels):
     else:
         raise NotImplementedError
 
-class ConvBlock1D(nn.Module):
-    def __init__(self, in_channel, out_channel, kernel_size, stride, padding, 
-                 dilation, groups, bias=True, use_bn=True, use_act=True, act='tanh'):
-        super(ConvBlock1D, self).__init__()
-        self.use_bn = use_bn
-        self.use_act = use_act
-        
-        self.conv = nn.Conv1d(in_channel, out_channel, kernel_size, stride, 
-                             padding, dilation, groups, bias)
-        self.bn = nn.BatchNorm1d(out_channel)
-        self.tanh = _get_act_func(act, in_channel)
-
-    def forward(self, x):
-        x = self.conv(x)
-        if self.use_bn:
-            x = self.bn(x)
-        if self.use_act:
-            x = self.tanh(x)
-        return x
-
-
-class ResidualBlock1D(nn.Module):
-    def __init__(self, in_channel, out_channel, kernel_size, stride, p=0.0):
-        super(ResidualBlock1D, self).__init__()
-        self.stride = stride
-        
-        self.bn1 = nn.BatchNorm1d(in_channel)
-        self.relu1 = nn.ReLU()
-        self.dropout1 = nn.Dropout(p=p)
-        
-        self.conv1 = nn.Conv1d(in_channel, out_channel, kernel_size,
-                              stride=stride, 
-                              padding=int((kernel_size - stride + 1) / 2),
-                              dilation=1, groups=1)
-        
-        self.bn2 = nn.BatchNorm1d(out_channel)
-        self.relu2 = nn.ReLU()
-        self.dropout2 = nn.Dropout(p=p)
-        
-        self.conv2 = nn.Conv1d(out_channel, out_channel, kernel_size,
-                              stride=1, 
-                              padding=int((kernel_size - 1) / 2),
-                              dilation=1, groups=1)
-        
-        self.avg_pool = nn.AvgPool1d(kernel_size=stride)
-
-    def forward(self, x):
-        net = self.conv1(self.relu1(self.bn1(x)))
-        net = self.conv2(self.relu2(self.bn2(net)))
-        
-        if self.stride == 1:
-            res = net + x
-        else:
-            res = net + self.avg_pool(x)
-        
-        return res
-
-
-class ASPP1D(nn.Module):
-    def __init__(self, in_channel, out_channel, kernel_size, 
-                 dilations=(1, 6, 12, 18), use_bn=True, use_act=True, act_func='tanh'):
-        super(ASPP1D, self).__init__()
-        
-        self.num_scale = len(dilations)
-        self.convs = nn.ModuleList()
-        
-        for dilation in dilations:
-            padding = int(dilation * (kernel_size - 1) / 2.0)
-            self.convs.append(ConvBlock1D(in_channel, out_channel, kernel_size, 
-                                         stride=1, padding=padding, dilation=dilation, 
-                                         groups=1, use_bn=use_bn, use_act=use_act, 
-                                         act=act_func))
-
-    def forward(self, x):
-        feats = [self.convs[i](x) for i in range(self.num_scale)]
-        res = torch.cat(feats, dim=1)
-        return res
-
-
-class SELayer1D(nn.Module):
+class SELayer(nn.Module):
     def __init__(self, channel, reduction=16):
-        super(SELayer1D, self).__init__()
-        self.avg_pool = nn.AdaptiveAvgPool1d(1)
+        super(SELayer, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.fc = nn.Sequential(
             nn.Linear(channel, channel // reduction, bias=False),
             nn.ReLU(inplace=True),
@@ -109,18 +32,145 @@ class SELayer1D(nn.Module):
         )
 
     def forward(self, x):
-        b, c, _ = x.size()
+        b, c, _, _ = x.size()
         y = self.avg_pool(x).view(b, c)
-        y = self.fc(y).view(b, c, 1)
+        y = self.fc(y).view(b, c, 1, 1)
         return x * y.expand_as(x)
 
+class ResidualClassifier(nn.Module):
 
-class GAP1D(nn.Module):
-    def __init__(self):
-        super(GAP1D, self).__init__()
-        self.gap = nn.AdaptiveAvgPool1d(1)
+    def __init__(self, class_num):
+        super(ResidualClassifier, self).__init__()
+        self.class_num = class_num
+
+        self.fc = nn.Sequential(
+            nn.Linear(self.class_num, class_num),
+            nn.ReLU(),
+            nn.Linear(self.class_num, class_num)
+        )
 
     def forward(self, x):
+
+        return x + self.fc(x)
+
+
+def _get_act_func(act_func, in_channels):
+    if act_func == 'tanh':
+        return nn.Tanh()
+    elif act_func == 'leaky_relu':
+        # return nn.LeakyReLU(0.05)
+        return nn.LeakyReLU(0.01)
+    elif act_func == 'relu':
+        return nn.ReLU()
+    elif act_func == 'prelu':
+        return nn.PReLU(init=0.05)
+    elif act_func == 'cprelu':
+        return nn.PReLU(num_parameters=in_channels, init=0.05)
+    elif act_func == 'elu':
+        return nn.ELU()
+    else:
+        raise NotImplementedError
+
+
+class ConvBlock(nn.Module):
+
+    def __init__(self, in_channel, out_channel,
+                 kernel_size, stride, padding, dilation, groups,
+                 bias=True, padding_mode='zeros',
+                 use_bn=True, use_act=True,
+                 act='tanh'):
+        super(ConvBlock, self).__init__()
+        self.use_bn = use_bn
+        self.use_act = use_act
+
+        self.conv = nn.Conv2d(in_channel, out_channel,
+                              kernel_size, stride,
+                              padding, dilation,
+                              groups, bias, padding_mode)
+        self.bn = nn.BatchNorm2d(out_channel)
+        self.tanh = _get_act_func(act, in_channel)
+
+    def forward(self, x):
+
+        x = self.conv(x)
+        if self.use_bn:
+            x = self.bn(x)
+        if self.use_act:
+            x = self.tanh(x)
+        return x
+
+
+class ResidualBlock(nn.Module):
+    
+    def __init__(self, in_channel, out_channel,
+                 kernel_size, stride, p=0.0):
+        super(ResidualBlock, self).__init__()
+
+        self.stride = stride
+
+        self.bn1 = nn.BatchNorm2d(in_channel)
+        self.relu1 = nn.ReLU()
+        self.dropout1 = nn.Dropout(p=p)
+
+        self.conv1 = nn.Conv2d(in_channel, out_channel, (1, kernel_size),
+                               stride=(1, stride), padding=(0, int((kernel_size - stride + 1) / 2)),
+                               dilation=1, groups=1)
+
+        self.bn2 = nn.BatchNorm2d(out_channel)
+        self.relu2 = nn.ReLU()
+        self.dropout2 = nn.Dropout(p=p)
+
+        self.conv2 = nn.Conv2d(out_channel, out_channel, (1, kernel_size),
+                               stride=1, padding=(0, int((kernel_size - 1) / 2)),
+                               dilation=1, groups=1)
+
+        self.avg_pool = nn.AvgPool2d(kernel_size=(1, stride))
+
+    def forward(self, x):
+
+        net = self.conv1(self.relu1(self.bn1(x)))
+        net = self.conv2(self.relu2(self.bn2(net)))
+
+        if self.stride == 1:
+            res = net + x
+        else:
+            res = net + self.avg_pool(x)
+
+        return res
+
+
+class ASPP(nn.Module):
+
+    def __init__(self, in_channel, out_channel,
+                 kernel_size, dilations=(1, 6, 12, 18),
+                 use_bn=True, use_act=True, act_func='tanh'):
+        super(ASPP, self).__init__()
+
+        self.num_scale = len(dilations)
+
+        self.convs = nn.ModuleList()
+        for dilation in dilations:
+            padding = int(dilation * (kernel_size - 1) / 2.0)
+            self.convs.append(ConvBlock(in_channel, out_channel,
+                                        (1, kernel_size), stride=1, padding=(0, padding),
+                                        dilation=(1, dilation), groups=1, use_bn=use_bn,
+                                        use_act=use_act, act=act_func))
+
+    def forward(self, x):
+        feats = [self.convs[i](x) for i in range(self.num_scale)]
+        res = torch.cat(feats, dim=1)
+        return res
+
+
+class GAP(nn.Module):
+
+    def __init__(self):
+        super(GAP, self).__init__()
+
+        self.gap = nn.AdaptiveAvgPool2d(1)
+
+    def forward(self, x):
+
         return self.gap(x)
 
 
@@ -291,6 +341,7 @@ class MultiHeadCrossAttentionFusionBlock(nn.Module):
 #=========================================================================================
 # main model class 
 #=========================================================================================
+
 class MACNN_SE(nn.Module): 
     def __init__(self, reduction=16, aspp_bn=True, aspp_act=True, lead=1, p=0.0, 
                  dilations=(1, 6, 12, 18), act_func='tanh', f_act_func='tanh', 
@@ -302,28 +353,20 @@ class MACNN_SE(nn.Module):
         self.apply_residual = apply_residual 
         self.fusion_type = fusion_type
         
-        self.conv1 = nn.Conv1d(lead, 4, kernel_size=3, stride=1, padding=1, 
-                              dilation=1, groups=1) 
-        
-        self.aspp_1 = ASPP1D(4, 4, 3, dilations=dilations, use_bn=aspp_bn, 
-                            use_act=aspp_act, act_func=act_func) 
-        self.se_layer_1 = SELayer1D(self.dila_num * 4, reduction=4) 
-        self.residual_1 = ResidualBlock1D(self.dila_num * 4, self.dila_num * 4, 3, 1, p=p) 
-        
-        self.aspp_2 = ASPP1D(self.dila_num * 4, self.dila_num * 4, 3, dilations=dilations, 
-                            use_bn=aspp_bn, use_act=aspp_act, act_func=act_func) 
-        self.se_layer_2 = SELayer1D(self.dila_num ** 2 * 4, reduction=8) 
-        self.residual_2 = ResidualBlock1D(self.dila_num ** 2 * 4, self.dila_num ** 2 * 4, 3, 2, p=p) 
-        
-        self.bn = nn.BatchNorm1d(self.dila_num ** 2 * 4) 
+        self.conv1 = nn.Conv2d(lead, 4, kernel_size=(3, 3), stride=1, padding=(0, 1), dilation=(1, 1), groups=1) 
+        self.aspp_1 = ASPP(4, 4, 3, dilations=dilations, use_bn=aspp_bn, use_act=aspp_act, act_func=act_func) 
+        self.se_layer_1 = SELayer(self.dila_num * 4, reduction=4) 
+        self.residual_1 = ResidualBlock(self.dila_num * 4, self.dila_num * 4, 3, 1, p=p) 
+        self.aspp_2 = ASPP(self.dila_num * 4, self.dila_num * 4, 3, dilations=dilations, use_bn=aspp_bn, use_act=aspp_act, act_func=act_func) 
+        self.se_layer_2 = SELayer(self.dila_num ** 2 * 4, reduction=8) 
+        self.residual_2 = ResidualBlock(self.dila_num ** 2 * 4, self.dila_num ** 2 * 4, 3, 2, p=p) 
+        self.bn = nn.BatchNorm2d(self.dila_num ** 2 * 4) 
         self.relu = nn.ReLU() 
+        self.aspp = ASPP(self.dila_num ** 2 * 4, self.dila_num ** 2 * 4, 3, dilations=dilations, use_bn=aspp_bn, use_act=aspp_act, act_func=f_act_func) 
+        self.se_layer = SELayer(self.dila_num ** 3 * 4, reduction=reduction) 
+        self.gap = GAP() 
         
-        self.aspp = ASPP1D(self.dila_num ** 2 * 4, self.dila_num ** 2 * 4, 3, 
-                          dilations=dilations, use_bn=aspp_bn, use_act=aspp_act, 
-                          act_func=f_act_func) 
-        self.se_layer = SELayer1D(self.dila_num ** 3 * 4, reduction=reduction) 
-        self.gap = GAP1D() 
-        
+        # Fusion block selection
         if fusion_type == 'concat':
             self.fusion_block = ConcatFusionBlock(emb=fusion_emb, expansion=fusion_expansion)
             fc_input_dim = fusion_emb + rr_dim
@@ -345,6 +388,12 @@ class MACNN_SE(nn.Module):
         self.fc = nn.Linear(fc_input_dim, 4) 
         self.res_transfer = ResidualClassifier(4) 
 
+    def get_model_params(self):
+        """모델의 전체 파라미터 수와 학습 가능한 파라미터 수를 반환합니다."""
+        total_params = sum(p.numel() for p in self.parameters())
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        return total_params, trainable_params
+
     def forward(self, x, rr_features=None): 
         net = self.conv1(x) 
 
@@ -359,6 +408,7 @@ class MACNN_SE(nn.Module):
         net = self.relu(self.bn(net)) 
         net = self.gap(self.se_layer(self.aspp(net))).view(-1, self.dila_num ** 3 * 4) 
         
+
         if self.fusion_block is not None and rr_features is not None:
             net = self.feature_proj(net)  
             net = self.fusion_block(net, rr_features)
@@ -366,8 +416,7 @@ class MACNN_SE(nn.Module):
         logits = self.fc(net) 
         if self.apply_residual: 
             logits = self.res_transfer(logits) 
-
-        return logits, net
+        return logits, net 
 
     def get_feature_maps(self, x): 
         net = self.conv1(x) 
@@ -675,66 +724,12 @@ if __name__ == '__main__':
     
     # Pseudo inputs
     batch_size = 8
-    ecg_input = torch.randn(batch_size, 1, 720)  # (B, lead, 1, length)
-    rr_input = torch.randn(batch_size, 7)  # (B, rr_dim)
+    ecg_input = torch.randn(batch_size, 1,3 ,128)  # (B, lead, 1, length)
+    rr_input = torch.randn(batch_size, 2)  # (B, rr_dim)
     
     print("\n[1] MACNN_SE without fusion")
     print("-" * 80)
     model1 = MACNN_SE()
     total1 = sum([param.nelement() for param in model1.parameters()])
     print(f"Number of parameters: {total1/1e6:.2f}M")
-    features1, logits1 = model1(ecg_input)
-    print(f"Input shape: {ecg_input.shape}")
-    print(f"Features shape: {features1.shape}")
-    print(f"Logits shape: {logits1.shape}")
-    
-    print("\n[2] MACNN_SE with ConcatFusionBlock")
-    print("-" * 80)
-    model2 = MACNN_SE(fusion_type='concat', fusion_emb=64, fusion_expansion=2, rr_dim=7)
-    total2 = sum([param.nelement() for param in model2.parameters()])
-    print(f"Number of parameters: {total2/1e6:.2f}M")
-    features2, logits2 = model2(ecg_input, rr_input)
-    print(f"ECG input shape: {ecg_input.shape}")
-    print(f"RR input shape: {rr_input.shape}")
-    print(f"Features shape: {features2.shape}")
-    print(f"Logits shape: {logits2.shape}")
-    
-    print("\n[3] MACNN_SE with ConcatProjectionFusionBlock")
-    print("-" * 80)
-    model3 = MACNN_SE(fusion_type='concat_proj', fusion_emb=64, fusion_expansion=2, rr_dim=7)
-    total3 = sum([param.nelement() for param in model3.parameters()])
-    print(f"Number of parameters: {total3/1e6:.2f}M")
-    features3, logits3 = model3(ecg_input, rr_input)
-    print(f"ECG input shape: {ecg_input.shape}")
-    print(f"RR input shape: {rr_input.shape}")
-    print(f"Features shape: {features3.shape}")
-    print(f"Logits shape: {logits3.shape}")
-    
-    print("\n[4] MACNN_SE with MultiHeadCrossAttentionFusionBlock")
-    print("-" * 80)
-    model4 = MACNN_SE(fusion_type='mhca', fusion_emb=64, fusion_expansion=2, rr_dim=7, num_heads=4)
-    total4 = sum([param.nelement() for param in model4.parameters()])
-    print(f"Number of parameters: {total4/1e6:.2f}M")
-    features4, logits4 = model4(ecg_input, rr_input)
-    print(f"ECG input shape: {ecg_input.shape}")
-    print(f"RR input shape: {rr_input.shape}")
-    print(f"Features shape: {features4.shape}")
-    print(f"Logits shape: {logits4.shape}")
-    
-    print("\n" + "=" * 80)
-    print("Summary of Fusion Blocks")
-    print("=" * 80)
-    
-    fusion1 = ConcatFusionBlock(emb=64, expansion=2)
-    total_f1 = sum([param.nelement() for param in fusion1.parameters()])
-    print(f"ConcatFusionBlock: {total_f1/1e6:.2f}M parameters")
-    
-    fusion2 = ConcatProjectionFusionBlock(emb=64, expansion=2, rr_dim=7)
-    total_f2 = sum([param.nelement() for param in fusion2.parameters()])
-    print(f"ConcatProjectionFusionBlock: {total_f2/1e6:.2f}M parameters")
-    
-    fusion3 = MultiHeadCrossAttentionFusionBlock(emb=64, expansion=2, rr_dim=7, num_heads=4)
-    total_f3 = sum([param.nelement() for param in fusion3.parameters()])
-    print(f"MultiHeadCrossAttentionFusionBlock: {total_f3/1e6:.2f}M parameters")
-    
-    print("=" * 80)
+   

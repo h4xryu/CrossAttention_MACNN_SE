@@ -23,6 +23,11 @@ from torch.utils.data import DataLoader
 from openpyxl import load_workbook
 from openpyxl.utils.dataframe import dataframe_to_rows
 
+from logger import (
+    TrainingLogger, print_epoch_header, print_per_class_metrics,
+    print_epoch_stats, print_confidence_stats, print_epoch_time
+)
+
 from utils import set_seed, load_or_extract_data
 from model import MACNN_SE
 from dataloader import ECGDataset
@@ -36,8 +41,8 @@ from evaluate_module import evaluate, calculate_metrics, save_confusion_matrix
 DATA_PATH = './data/mit-bih-arrhythmia-database-1.0.0/'
 OUTPUT_PATH = './gridsearch_results/'
 TEMPLATE_PATH = './model_gridsearch.xlsx'
-BATCH_SIZE = 1024
-EPOCHS = 1
+BATCH_SIZE = 1024 * 8
+EPOCHS = 50
 LR = 0.0001
 WEIGHT_DECAY = 1e-3
 SEED = 1234
@@ -71,20 +76,14 @@ DS2_TEST = [
 # =============================================================================
 
 GRID_PARAMS = {
-    'fusion_emb': [32],
-    'fusion_expansion': [1],
+
+    'fusion_emb': [64, 128],
+    'fusion_expansion': [2, 4],
     'num_heads': [1],
-    'reduction': [8],
+    'reduction': [8, 16],
     'aspp_bn': [True],
     'aspp_act': [True],
-    'dilations': [(1,2,3,4)],
-    # 'fusion_emb': [32, 64, 128],
-    # 'fusion_expansion': [1, 2, 4],
-    # 'num_heads': [1, 2, 4, 8],
-    # 'reduction': [8, 16, 32],
-    # 'aspp_bn': [True],
-    # 'aspp_act': [True],
-    # 'dilations': [(1, 6, 12, 18), (1, 3, 6, 12)],
+    'dilations': [(1, 6, 12, 18), (1, 3, 6, 12)],
 }
 
 # =============================================================================
@@ -257,23 +256,35 @@ def run_single_experiment(params: dict, trial_num: int, total_trials: int,
         # 학습 설정
         optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.5)
-
+        logger = TrainingLogger(os.path.join(exp_dir, 'runs'))
         # Best 모델 추적
         best_auroc = {'value': 0.0, 'epoch': 0, 'state_dict': None}
         best_auprc = {'value': 0.0, 'epoch': 0, 'state_dict': None}
 
         # 학습 루프
         for epoch in range(1, EPOCHS + 1):
+            current_lr = optimizer.param_groups[0]['lr']
+
             # Train
-            train_loss, train_metrics, *_ = train_one_epoch(
-                model, train_loader, POLY1_EPS, POLY2_EPS, optimizer, device
+            train_loss, train_metrics, *p_t_train = train_one_epoch(
+                model, train_loader, POLY1_EPS, POLY2_EPS, epoch, optimizer, device
             )
 
+            print_epoch_stats(epoch, train_loss, train_metrics['acc'], current_lr, phase='Train')
+            # print_per_class_metrics(train_metrics, CLASSES, phase='Train')
+            # print_confidence_stats(*p_t_train, phase='Train')
+            logger.log_epoch(epoch, train_loss, train_metrics, phase='train')
+            logger.log_confidence(epoch, *p_t_train, phase='train')
             # Validation
-            valid_loss, valid_metrics, *_ = validate(
+            valid_loss, valid_metrics, *p_t_valid = validate(
                 model, valid_loader, POLY1_EPS, POLY2_EPS, device
             )
 
+            print_epoch_stats(epoch, valid_loss, valid_metrics['acc'], current_lr, phase='Valid')
+            # print_per_class_metrics(valid_metrics, CLASSES, phase='Valid')
+            # print_confidence_stats(*p_t_valid, phase='Valid')
+            logger.log_epoch(epoch, valid_loss, valid_metrics, phase='valid')
+            logger.log_confidence(epoch, *p_t_valid, phase='valid')
             # Best AUROC 체크
             if valid_metrics['macro_auroc'] > best_auroc['value']:
                 best_auroc = {
@@ -281,6 +292,7 @@ def run_single_experiment(params: dict, trial_num: int, total_trials: int,
                     'epoch': epoch,
                     'state_dict': copy.deepcopy(model.state_dict())
                 }
+                print(f"  ★ [BEST AUROC] {best_auroc['value']:.4f}")
 
             # Best AUPRC 체크
             if valid_metrics['macro_auprc'] > best_auprc['value']:
@@ -289,13 +301,11 @@ def run_single_experiment(params: dict, trial_num: int, total_trials: int,
                     'epoch': epoch,
                     'state_dict': copy.deepcopy(model.state_dict())
                 }
-
-            if epoch % 10 == 0:
-                print(f"  Epoch {epoch}/{EPOCHS} - Valid AUROC: {valid_metrics['macro_auroc']:.4f}, "
-                      f"AUPRC: {valid_metrics['macro_auprc']:.4f}")
+                print(f"  ★ [BEST AUPRC] {best_auprc['value']:.4f}")
 
             scheduler.step()
-
+            print("=" * 120 + "\n")
+        logger.close()    
         # =====================================================================
         # Best AUROC 모델로 테스트
         # =====================================================================
@@ -368,7 +378,7 @@ def run_single_experiment(params: dict, trial_num: int, total_trials: int,
         import traceback
         traceback.print_exc()
         result_dict['status'] = 'error'
-
+   
     return result_dict
 
 

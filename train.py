@@ -5,62 +5,77 @@ import torch.nn as nn
 import numpy as np
 from sklearn.metrics import confusion_matrix, accuracy_score, precision_recall_fscore_support
 import torch.nn.functional as F
+from tqdm import tqdm
 
+def train_one_epoch(model: nn.Module, train_loader, num_epoch: int,
+                    optimizer: torch.optim.Optimizer, device: torch.device,
+                    scheduler=None, class_weights=None) -> tuple:
+    """
+    Train one epoch with optional scheduler step per iteration (DAEAC style).
 
-def train_one_epoch(model: nn.Module, train_loader, alpha1: float, alpha2: float,
-                    optimizer: torch.optim.Optimizer, device: torch.device) -> tuple:
+    Args:
+        scheduler: If provided, scheduler.step() is called after each iteration
+        class_weights: Optional tensor of class weights for weighted CE loss
+    """
     model.train()
     total_loss = 0.0
     y_pred, y_true = [], []
     y_probs_all = []  # For AUPRC/AUROC
-    
+
     p_t_n_all = []  # N 클래스
     p_t_s_all = []  # S 클래스
     p_t_v_all = []  # V 클래스
     p_t_f_all = []  # F 클래스
-    
-    for batch in train_loader:
+
+    for batch in tqdm(train_loader, desc=f"Training Epoch {num_epoch} ", leave=True):
         ecg_inputs, rr_features, labels, pids, _ = batch
         ecg_inputs = ecg_inputs.to(device)
         rr_features = rr_features.to(device)
         labels = labels.to(device)
-        
+
         optimizer.zero_grad()
         logits, _ = model(ecg_inputs, rr_features)
         probs = torch.softmax(logits, dim=1)
         p_t = probs[torch.arange(len(labels)), labels]  # (B,)
-        
+
         # Store predictions and probabilities
         preds = torch.argmax(logits, dim=1)
         y_pred.extend(preds.cpu().numpy())
         y_true.extend(labels.cpu().numpy())
         y_probs_all.append(probs.detach().cpu().numpy())
-        
+
         # Collect p_t per class (클래스별 confidence 수집)
         n_mask = (labels == 0)
         if n_mask.any():
             p_t_n_all.append(p_t[n_mask].detach().cpu())
-        
+
         s_mask = (labels == 1)
         if s_mask.any():
             p_t_s_all.append(p_t[s_mask].detach().cpu())
-        
+
         v_mask = (labels == 2)
         if v_mask.any():
             p_t_v_all.append(p_t[v_mask].detach().cpu())
-        
+
         f_mask = (labels == 3)
         if f_mask.any():
             p_t_f_all.append(p_t[f_mask].detach().cpu())
-        
-        # Loss calculation: CE + α₁(1-p_t) + α₂(1-p_t)²
-        ce_loss = F.cross_entropy(logits, labels, reduction='none')
-        # poly_term = alpha1 * (1 - p_t) + alpha2 * (1 - p_t)**2
-        loss = ce_loss.mean()
-        
+
+        # Loss calculation: weighted cross-entropy (DAEAC uses weighted CE)
+        if class_weights is not None:
+            ce_loss = F.cross_entropy(logits, labels, weight=class_weights, reduction='mean')
+        else:
+            ce_loss = F.cross_entropy(logits, labels, reduction='mean')
+
+        loss = ce_loss
+
         loss.backward()
         optimizer.step()
-        
+
+        # DAEAC style: LR decay every iteration
+        if scheduler is not None:
+            scheduler.step()
+
         total_loss += loss.item()
     
     # Calculate metrics
@@ -113,12 +128,12 @@ def train_one_epoch(model: nn.Module, train_loader, alpha1: float, alpha2: float
     p_t_s_all = torch.cat(p_t_s_all, dim=0) if p_t_s_all else torch.empty(0)
     p_t_v_all = torch.cat(p_t_v_all, dim=0) if p_t_v_all else torch.empty(0)
     p_t_f_all = torch.cat(p_t_f_all, dim=0) if p_t_f_all else torch.empty(0)
-    
+
     return (total_loss / len(train_loader), metrics, 
             p_t_n_all, p_t_s_all, p_t_v_all, p_t_f_all)
 
 
-def validate(model: nn.Module, valid_loader, alpha1: float, alpha2: float, device: torch.device) -> tuple:
+def validate(model: nn.Module, valid_loader, device: torch.device) -> tuple:
     """Validation function"""
     model.eval()
     total_loss = 0.0
@@ -166,7 +181,7 @@ def validate(model: nn.Module, valid_loader, alpha1: float, alpha2: float, devic
             
             # Loss calculation (for monitoring)
             ce_loss = F.cross_entropy(logits, labels, reduction='none')
-            # poly_term = alpha1 * (1 - p_t) + alpha2 * (1 - p_t)**2
+
             loss = ce_loss.mean()
             
             total_loss += loss.item()
