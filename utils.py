@@ -258,7 +258,9 @@ def compute_rr_features_opt2(
         pre_rr_ratio,       # [0] pre-RR ratio (global)
         near_pre_rr_ratio,  # [1] near-pre-RR ratio (local, last 10)
     ], axis=1).astype(np.float32)
-
+    print(pre_rr_ratio)
+    print(pre_rr_ratio.shape)
+    
     return all_features
 
 

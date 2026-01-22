@@ -60,28 +60,6 @@ class ECGDataset(Dataset):
 # =============================================================================
 
 class DAEACDataset(Dataset):
-    """
-    DAEAC 논문용 ECG Dataset (opt2)
-
-    Reference:
-        "Inter-patient ECG arrhythmia heartbeat classification based on
-        unsupervised domain adaptation" (Wang et al., 2021)
-
-    입력 형태: 3채널 (1, 3, L)
-    - Channel 0: ECG segment (128 samples)
-    - Channel 1: pre_rr_ratio (repeated to 128)
-    - Channel 2: near_pre_rr_ratio (repeated to 128)
-
-    현재 MACNN_SE 모델은 2D Conv를 사용하므로 출력 형태:
-        (B, 1, 3, L) - lead=1, 3채널을 height로 사용
-
-    Args:
-        data: (N, L) ECG segments
-        rr_features: (N, 2) [pre_rr_ratio, near_pre_rr_ratio]
-        labels: (N,) class labels
-        patient_ids: (N,) patient IDs
-        sample_ids: (N,) sample indices
-    """
 
     def __init__(self, data, rr_features, labels, patient_ids, sample_ids):
         self.data = data
@@ -95,24 +73,42 @@ class DAEACDataset(Dataset):
         return len(self.labels)
 
     def __getitem__(self, idx):
+
+
+        rr = np.asarray(self.rr_features[idx], dtype=np.float32)
+        print(self.rr_features.shape)
+        print(rr.shape)
+        if rr.ndim == 0:
+            raise ValueError(
+                f"DAEACDataset expects rr_features[idx] to be (2,), got scalar"
+            )
+
+        if rr.shape[0] != 2:
+            raise ValueError(
+                f"DAEACDataset expects rr_features dim=2, got {rr.shape}"
+            )
+
         # ECG segment
         ecg = self.data[idx]  # (L,)
 
-        # RR features를 ECG와 같은 길이로 repeat
-        rr = self.rr_features[idx]  # (2,)
+        # RR features를 ECG 길이로 repeat
         pre_rr_ratio = np.full(self.seq_len, rr[0], dtype=np.float32)
         near_pre_rr_ratio = np.full(self.seq_len, rr[1], dtype=np.float32)
 
-        # 3채널 입력 생성: (3, L) -> 2D Conv 형식: (1, 3, L)
-        x = np.stack([ecg, pre_rr_ratio, near_pre_rr_ratio], axis=0)  # (3, L)
-        x = x[np.newaxis, :, :]  # (1, 3, L) for 2D Conv
+        # (3, L) → (1, 3, L)
+        print(pre_rr_ratio)
+        x = np.stack(
+            [ecg, pre_rr_ratio, near_pre_rr_ratio],
+            axis=0
+        )
+        x = x[np.newaxis, :, :]
 
         return (
             torch.from_numpy(x).float(),
             torch.tensor(self.labels[idx], dtype=torch.long),
-            torch.from_numpy(rr).float(),
-            torch.tensor(self.patient_ids[idx], dtype=torch.long),
-            torch.tensor(self.sample_ids[idx], dtype=torch.long),
+            torch.from_numpy(rr).float(),          # (2,)
+            torch.tensor(self.patient_ids[idx]),
+            torch.tensor(self.sample_ids[idx]),
         )
 
 
