@@ -27,7 +27,7 @@ DEVICE = "cuda"  # "auto", "cuda", "cpu", "cuda:0", etc.
 # =============================================================================
 # 2. 경로 설정
 # =============================================================================
-DATA_PATH = './data/mit-bih-arrhythmia-database-1.0.0/'
+DATA_PATH = '/home/work/Ryuha/ECG_CrossAttention/data/mit-bih-arrhythmia-database-1.0.0/'
 OUTPUT_PATH = './results/'
 CACHE_PATH = './dataset/'
 
@@ -180,7 +180,7 @@ SCHEDULER_CONFIG = {
 # =============================================================================
 # 10. 학습 설정
 # =============================================================================
-EPOCHS = 300
+EPOCHS = 5
 BATCH_SIZE = 256
 NUM_WORKERS = 4
 PIN_MEMORY = True

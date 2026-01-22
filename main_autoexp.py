@@ -24,6 +24,7 @@ from src import models, losses, datasets
 from src.optimizers import build_optimizer
 from src.schedulers import build_scheduler
 from src.trainer import Trainer
+from src.utils import ExcelResultWriter
 from utils import set_seed, load_or_extract_data
 
 
@@ -123,7 +124,13 @@ def run_single_experiment(exp_config: dict, exp_name: str, data_loaders: tuple, 
     trainer.fit(epochs=EXP_EPOCHS)
 
     # 테스트
-    results = {}
+    results = {
+        'exp_name': exp_name,
+        'config': exp_config,
+        'status': 'success',
+        'full_metrics': {},  # 엑셀 저장용 전체 metrics
+    }
+
     for metric in ["macro_auprc", "macro_auroc", "macro_recall"]:
         trainer.load_best_model(metric)
         test_metrics = trainer.evaluate(test_loader)
@@ -133,10 +140,7 @@ def run_single_experiment(exp_config: dict, exp_name: str, data_loaders: tuple, 
             'macro_auprc': test_metrics['macro_auprc'],
             'macro_auroc': test_metrics['macro_auroc'],
         }
-
-    results['exp_name'] = exp_name
-    results['config'] = exp_config
-    results['status'] = 'success'
+        results['full_metrics'][metric] = test_metrics  # 전체 metrics 저장
 
     return results
 
@@ -264,13 +268,33 @@ def main():
         else:
             print(f"{result['exp_name']:<20} FAILED")
 
-    # 결과 저장
+    # JSON 결과 저장
     import json
     results_path = os.path.join(OUTPUT_DIR, "results_summary.json")
     with open(results_path, 'w') as f:
         json.dump(all_results, f, indent=2, default=str)
 
-    print(f"\nResults saved to: {results_path}")
+    # 엑셀 결과 저장 (템플릿이 있는 경우)
+    template_path = "./model_fusion.xlsx"
+    if os.path.exists(template_path):
+        excel_path = os.path.join(OUTPUT_DIR, "autoexp_results.xlsx")
+        excel_writer = ExcelResultWriter(template_path, excel_path, classes=config.CLASSES)
+
+        for result in all_results:
+            if result['status'] == 'success' and 'full_metrics' in result:
+                exp_name = result['exp_name']
+                # 모든 best model 결과 저장 (auprc, auroc, recall)
+                for metric_name in ["macro_auprc", "macro_auroc", "macro_recall"]:
+                    if metric_name in result['full_metrics']:
+                        metrics = result['full_metrics'][metric_name]
+                        short_name = metric_name.replace("macro_", "")  # auprc, auroc, recall
+                        excel_writer.write_metrics(exp_name, metrics, short_name)
+                        if 'confusion_matrix' in metrics:
+                            excel_writer.write_confusion_matrix(exp_name, metrics['confusion_matrix'], short_name)
+
+        print(f"Excel results saved to: {excel_path}")
+
+    print(f"\nJSON results saved to: {results_path}")
 
 
 if __name__ == '__main__':
