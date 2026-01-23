@@ -102,19 +102,14 @@ class Trainer:
         Train for one epoch.
 
         Returns:
-            (loss, metrics_dict)
+            (loss, metrics_dict) - metrics는 간소화된 버전 (acc만)
         """
         self.model.train()
         total_loss = 0.0
-        all_preds, all_labels, all_probs = [], [], []
+        correct = 0
+        total = 0
 
-        pbar = tqdm(
-            self.train_loader,
-            desc=f"Epoch {self.current_epoch} [Train]",
-            leave=True
-        )
-
-        for batch in pbar:
+        for batch in self.train_loader:
             # Unpack batch: (ecg, label, rr, pid, sid)
             ecg, labels, rr_features, *_ = batch
             ecg = ecg.to(self.device)
@@ -141,24 +136,23 @@ class Trainer:
             if self.scheduler is not None:
                 self.scheduler.step()
 
-            # Collect predictions
-            probs = torch.softmax(logits, dim=1)
+            # Simple accuracy (no sklearn overhead)
             preds = torch.argmax(logits, dim=1)
-
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
-            all_probs.append(probs.detach().cpu().numpy())
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
 
             total_loss += loss.item()
-            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
 
-        # Calculate metrics
-        all_labels = np.array(all_labels)
-        all_preds = np.array(all_preds)
-        all_probs = np.concatenate(all_probs, axis=0)
-
-        metrics = self._calculate_metrics(all_labels, all_preds, all_probs)
         avg_loss = total_loss / len(self.train_loader)
+        acc = correct / total
+
+        # 간소화된 metrics (train은 loss/acc만 필요)
+        metrics = {
+            'acc': acc,
+            'macro_f1': 0.0,  # placeholder
+            'macro_auprc': 0.0,
+            'macro_auroc': 0.0,
+        }
 
         return avg_loss, metrics
 
@@ -269,7 +263,8 @@ class Trainer:
                 self._save_checkpoint(epoch, valid_metrics)
 
         # Save final model
-        self._save_checkpoint(epoch, valid_metrics, filename='final_model.pth')
+        final_path = os.path.join(self.checkpoint_dir, 'final_model.pth')
+        self._save_checkpoint(epoch, valid_metrics, final_path)
 
         print("\n" + "=" * 60)
         print("Training Complete!")
@@ -439,10 +434,9 @@ class Trainer:
 
         print(f"\nEpoch {epoch}/{total_epochs} ({elapsed:.1f}s) | LR: {lr:.6f}")
         print("-" * 60)
-        print(f"  Train | Loss: {train_loss:.4f} | Acc: {train_metrics['acc']:.4f} | "
-              f"F1: {train_metrics['macro_f1']:.4f} | AUPRC: {train_metrics['macro_auprc']:.4f}")
+        print(f"  Train | Loss: {train_loss:.4f} | Acc: {train_metrics['acc']:.4f}")
         print(f"  Valid | Loss: {valid_loss:.4f} | Acc: {valid_metrics['acc']:.4f} | "
-              f"F1: {valid_metrics['macro_f1']:.4f} | AUPRC: {valid_metrics['macro_auprc']:.4f}")
+              f"F1: {valid_metrics['macro_f1']:.4f} | AUPRC: {valid_metrics['macro_auprc']:.4f} | AUROC: {valid_metrics['macro_auroc']:.4f}")
 
     def _print_best_models(self):
         """Print best model summary."""

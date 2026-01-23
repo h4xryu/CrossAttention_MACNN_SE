@@ -2,4 +2,4 @@
 Utility modules
 """
 
-from .excel_writer import ExcelResultWriter
+from .excel_writer import ExcelResultWriter, CumulativeExcelWriter

@@ -8,6 +8,38 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# =============================================================================
+# Helpers (shape-safe)
+# =============================================================================
+
+def _ensure_2d_feat(x: torch.Tensor) -> torch.Tensor:
+    """
+    Accept (B, C) or (B, T, C) and return (B, C).
+    """
+    if not isinstance(x, torch.Tensor):
+        raise TypeError(f"x must be torch.Tensor, got {type(x)}")
+
+    if x.dim() == 2:
+        return x
+    if x.dim() == 3:
+        return x.mean(dim=1)
+    raise ValueError(f"x must be 2D or 3D, got shape={tuple(x.shape)}")
+
+
+def _ensure_3d_seq(x: torch.Tensor) -> torch.Tensor:
+    """
+    Accept (B, C) or (B, T, C) and return (B, T, C).
+    If (B, C), convert to (B, 1, C).
+    """
+    if not isinstance(x, torch.Tensor):
+        raise TypeError(f"x must be torch.Tensor, got {type(x)}")
+
+    if x.dim() == 3:
+        return x
+    if x.dim() == 2:
+        return x.unsqueeze(1)
+    raise ValueError(f"x must be 2D or 3D, got shape={tuple(x.shape)}")
+
 
 def get_activation(name: str, in_channels: int = None):
     """
@@ -317,17 +349,13 @@ class ConcatProjectionFusion(nn.Module):
         return torch.cat([self.rr_proj(rr_features), self.mlp(x)], dim=1)
 
 
+
 class MultiHeadCrossAttentionFusion(nn.Module):
     """
-    Multi-head Cross Attention Fusion.
+    RR (Query) → ECG (Key, Value)
+    Cross-Attention + FFN (Transformer-style)
 
-    RR features attend to ECG features via cross-attention.
-
-    Args:
-        emb_dim: Embedding dimension
-        expansion: MLP expansion factor
-        rr_dim: RR feature dimension
-        num_heads: Number of attention heads
+    Output is aligned to 2 * emb_dim to be consistent with concat_proj fusion.
     """
 
     def __init__(
@@ -339,18 +367,22 @@ class MultiHeadCrossAttentionFusion(nn.Module):
         **kwargs
     ):
         super().__init__()
+        if emb_dim % num_heads != 0:
+            raise ValueError(f"emb_dim({emb_dim}) must be divisible by num_heads({num_heads}).")
+
+        self.emb_dim = emb_dim
+        self.rr_dim = rr_dim
+        self.num_heads = num_heads
+        self.out_dim = 2 * emb_dim  # 🔴 핵심 수정
+
+        # RR → Query projection
         self.rr_proj = nn.Sequential(
             nn.Linear(rr_dim, emb_dim),
             nn.LayerNorm(emb_dim),
             nn.GELU()
         )
-        self.mlp = nn.Sequential(
-            nn.Linear(emb_dim, expansion * emb_dim),
-            nn.LayerNorm(expansion * emb_dim),
-            nn.GELU(),
-            nn.Dropout(0.2),
-            nn.Linear(expansion * emb_dim, emb_dim),
-        )
+
+        # Cross-Attention
         self.cross_attn = nn.MultiheadAttention(
             embed_dim=emb_dim,
             num_heads=num_heads,
@@ -358,16 +390,53 @@ class MultiHeadCrossAttentionFusion(nn.Module):
             batch_first=True
         )
 
+        # FFN (Position-wise)
+        self.ffn = nn.Sequential(
+            nn.Linear(emb_dim, expansion * emb_dim),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            nn.Linear(expansion * emb_dim, emb_dim),
+        )
+
+        self.norm1 = nn.LayerNorm(emb_dim)
+        self.norm2 = nn.LayerNorm(emb_dim)
+
     def forward(self, x: torch.Tensor, rr_features: torch.Tensor) -> torch.Tensor:
-        # x: (B, emb_dim), rr_features: (B, rr_dim)
-        rr_proj = self.rr_proj(rr_features).unsqueeze(1)  # (B, 1, emb)
-        x_mlp = self.mlp(x).unsqueeze(1)                   # (B, 1, emb)
+        """
+        Args:
+            x: (B, T, emb_dim) or (B, emb_dim)
+            rr_features: (B, rr_dim)
+        Returns:
+            (B, 2 * emb_dim)
+        """
 
-        # Cross-attention: RR attends to ECG
-        attn_out, _ = self.cross_attn(rr_proj, x_mlp, x_mlp)
-        attn_out = attn_out.squeeze(1)  # (B, emb)
+        # Ensure ECG is sequence
+        if x.dim() == 2:
+            x_seq = x.unsqueeze(1)          # (B, 1, emb)
+            x_pool = x                      # (B, emb)
+        elif x.dim() == 3:
+            x_seq = x                       # (B, T, emb)
+            x_pool = x.mean(dim=1)          # (B, emb)
+        else:
+            raise ValueError(f"x must be 2D or 3D, got {tuple(x.shape)}")
 
-        return torch.cat([attn_out, x_mlp.squeeze(1)], dim=1)
+        # RR → Query
+        q = self.rr_proj(rr_features).unsqueeze(1)  # (B, 1, emb)
+
+        # Cross-Attention
+        attn_out, _ = self.cross_attn(
+            query=q,
+            key=x_seq,
+            value=x_seq
+        )  # (B, 1, emb)
+
+        attn_out = self.norm1(attn_out.squeeze(1))  # (B, emb)
+
+        # FFN + Residual
+        attn_out = self.norm2(attn_out + self.ffn(attn_out))  # (B, emb)
+
+        return torch.cat([attn_out, x_pool], dim=1)  # (B, 2*emb)
+
 
 
 # Fusion block factory

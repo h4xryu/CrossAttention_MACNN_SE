@@ -24,7 +24,7 @@ from src import models, losses, datasets
 from src.optimizers import build_optimizer
 from src.schedulers import build_scheduler
 from src.trainer import Trainer
-from src.utils import ExcelResultWriter
+from src.utils import ExcelResultWriter, CumulativeExcelWriter
 from utils import set_seed, load_or_extract_data
 
 
@@ -36,13 +36,22 @@ from utils import set_seed, load_or_extract_data
 EXPERIMENT_GRID = {
     # Fusion type 실험 (opt1, lead=1일 때만 의미있음)
     "fusion_type": [None, "concat", "concat_proj", "mhca"],
+    # "fusion_type": ["mhca"],
 
     # MHCA용 num_heads (fusion_type="mhca"일 때만 사용)
-    "fusion_num_heads": [1, 2, 4],
+    "fusion_num_heads": [1, 2, 4, 8],
+}
+
+# Fusion 실험용 설정 (late fusion은 opt1 스타일 필요)
+FUSION_EXP_CONFIG = {
+    "lead": 1,           # ECG only (RR은 late fusion으로)
+    "rr_dim": 7,         # opt1: 7 features
+    "dataset_name": "ecg_standard",
+    "rr_feature_option": "opt1",
 }
 
 # 실험별 epochs (빠른 실험용)
-EXP_EPOCHS = 50
+EXP_EPOCHS = 20
 
 # 결과 저장 경로
 OUTPUT_DIR = "./autoexp_results/"
@@ -52,20 +61,27 @@ OUTPUT_DIR = "./autoexp_results/"
 # 실험 실행 함수
 # =============================================================================
 
-def run_single_experiment(exp_config: dict, exp_name: str, data_loaders: tuple, device):
+def run_single_experiment(exp_config: dict, exp_name: str, data_loaders: dict, device):
     """
     단일 실험 수행
 
     Args:
         exp_config: 실험 설정 dict (MODEL_CONFIG에 병합됨)
         exp_name: 실험 이름
-        data_loaders: (train_loader, valid_loader, test_loader)
+        data_loaders: {"opt1": loaders, "opt2": loaders} 형태
         device: torch device
 
     Returns:
         결과 dict
     """
-    train_loader, valid_loader, test_loader = data_loaders
+    # Fusion 실험이면 opt1 데이터로더 사용
+    fusion_type = exp_config.get('fusion_type')
+    if fusion_type is not None and fusion_type.lower() != 'none':
+        loaders = data_loaders["opt1"]
+    else:
+        loaders = data_loaders["opt2"]
+
+    train_loader, valid_loader, test_loader = loaders
 
     print(f"\n{'='*60}")
     print(f"Experiment: {exp_name}")
@@ -80,6 +96,14 @@ def run_single_experiment(exp_config: dict, exp_name: str, data_loaders: tuple, 
 
     # 모델 설정 병합
     model_config = copy.deepcopy(config.MODEL_CONFIG)
+
+    # Fusion 실험이면 opt1 설정 적용 (lead=1, rr_dim=7)
+    if fusion_type is not None and fusion_type.lower() != 'none':
+        model_config.update({
+            "lead": FUSION_EXP_CONFIG["lead"],
+            "rr_dim": FUSION_EXP_CONFIG["rr_dim"],
+        })
+
     model_config.update(exp_config)
 
     # 모델 생성
@@ -150,8 +174,17 @@ def generate_experiments():
     experiments = []
 
     for fusion_type in EXPERIMENT_GRID["fusion_type"]:
-        if fusion_type == "mhca":
-            # MHCA는 num_heads별로 실험
+        if fusion_type is None:
+            # Baseline: opt2 (DAEAC style, early fusion)
+            exp_config = {
+                "fusion_type": None,
+                "lead": 3,      # opt2: ECG + 2 RR channels
+                "rr_dim": 2,    # opt2: 2 RR features
+            }
+            exp_name = "baseline_opt2"
+            experiments.append((exp_config, exp_name))
+        elif fusion_type == "mhca":
+            # MHCA는 num_heads별로 실험 (opt1 style)
             for num_heads in EXPERIMENT_GRID["fusion_num_heads"]:
                 exp_config = {
                     "fusion_type": fusion_type,
@@ -160,8 +193,9 @@ def generate_experiments():
                 exp_name = f"mhca_h{num_heads}"
                 experiments.append((exp_config, exp_name))
         else:
+            # concat, concat_proj: opt1 style (late fusion)
             exp_config = {"fusion_type": fusion_type}
-            exp_name = f"fusion_{fusion_type}" if fusion_type else "baseline"
+            exp_name = f"fusion_{fusion_type}"
             experiments.append((exp_config, exp_name))
 
     return experiments
@@ -182,48 +216,58 @@ def main():
     OUTPUT_DIR = os.path.join(OUTPUT_DIR, timestamp)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    # 데이터 로드 (한 번만)
+    # 데이터 로드 (opt1, opt2 모두 로드)
     print("\n[1/3] Loading Data...")
 
-    def load_split(records, split_name):
+    def load_split(records, split_name, extraction_style):
         return load_or_extract_data(
             record_list=records,
             base_path=config.DATA_PATH,
             valid_leads=config.VALID_LEADS,
             out_len=config.SIGNAL_LENGTH,
             split_name=split_name,
-            extraction_style=config.EXTRACTION_STYLE
+            extraction_style=extraction_style
         )
 
-    train_data = load_split(config.DS1_TRAIN, "Train")
-    valid_data = load_split(config.DS1_VALID, "Valid")
-    test_data = load_split(config.DS2_TEST, "Test")
+    data_loaders = {}
 
-    # Dataset 생성
-    DatasetClass = DATASET_REGISTRY.get(config.DATASET_NAME)
-    train_dataset = DatasetClass(*train_data)
-    valid_dataset = DatasetClass(*valid_data)
-    test_dataset = DatasetClass(*test_data)
+    # opt2 (DAEAC style) - baseline용
+    print("  Loading opt2 (DAEAC) data...")
+    train_data_opt2 = load_split(config.DS1_TRAIN, "Train", "daeac")
+    valid_data_opt2 = load_split(config.DS1_VALID, "Valid", "daeac")
+    test_data_opt2 = load_split(config.DS2_TEST, "Test", "daeac")
 
-    # DataLoader 생성
-    train_loader = DataLoader(
-        train_dataset, batch_size=config.BATCH_SIZE,
-        shuffle=True, num_workers=config.NUM_WORKERS, pin_memory=True
-    )
-    valid_loader = DataLoader(
-        valid_dataset, batch_size=config.BATCH_SIZE,
-        shuffle=False, num_workers=config.NUM_WORKERS, pin_memory=True
-    )
-    test_loader = DataLoader(
-        test_dataset, batch_size=config.BATCH_SIZE,
-        shuffle=False, num_workers=config.NUM_WORKERS, pin_memory=True
+    DatasetClass_opt2 = DATASET_REGISTRY.get("daeac")
+    train_ds_opt2 = DatasetClass_opt2(*train_data_opt2)
+    valid_ds_opt2 = DatasetClass_opt2(*valid_data_opt2)
+    test_ds_opt2 = DatasetClass_opt2(*test_data_opt2)
+
+    data_loaders["opt2"] = (
+        DataLoader(train_ds_opt2, batch_size=config.BATCH_SIZE, shuffle=True, num_workers=config.NUM_WORKERS, pin_memory=True),
+        DataLoader(valid_ds_opt2, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=config.NUM_WORKERS, pin_memory=True),
+        DataLoader(test_ds_opt2, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=config.NUM_WORKERS, pin_memory=True),
     )
 
-    data_loaders = (train_loader, valid_loader, test_loader)
+    # opt1 (Standard) - fusion 실험용
+    print("  Loading opt1 (Standard) data...")
+    train_data_opt1 = load_split(config.DS1_TRAIN, "Train", "default")
+    valid_data_opt1 = load_split(config.DS1_VALID, "Valid", "default")
+    test_data_opt1 = load_split(config.DS2_TEST, "Test", "default")
 
-    print(f"  Train: {len(train_dataset)} samples")
-    print(f"  Valid: {len(valid_dataset)} samples")
-    print(f"  Test:  {len(test_dataset)} samples")
+    DatasetClass_opt1 = DATASET_REGISTRY.get("ecg_standard")
+    train_ds_opt1 = DatasetClass_opt1(*train_data_opt1)
+    valid_ds_opt1 = DatasetClass_opt1(*valid_data_opt1)
+    test_ds_opt1 = DatasetClass_opt1(*test_data_opt1)
+
+    data_loaders["opt1"] = (
+        DataLoader(train_ds_opt1, batch_size=config.BATCH_SIZE, shuffle=True, num_workers=config.NUM_WORKERS, pin_memory=True),
+        DataLoader(valid_ds_opt1, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=config.NUM_WORKERS, pin_memory=True),
+        DataLoader(test_ds_opt1, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=config.NUM_WORKERS, pin_memory=True),
+    )
+
+    print(f"  Train: {len(train_ds_opt2)} samples (opt2), {len(train_ds_opt1)} samples (opt1)")
+    print(f"  Valid: {len(valid_ds_opt2)} samples (opt2), {len(valid_ds_opt1)} samples (opt1)")
+    print(f"  Test:  {len(test_ds_opt2)} samples (opt2), {len(test_ds_opt1)} samples (opt1)")
 
     # 실험 목록 생성
     experiments = generate_experiments()
@@ -293,6 +337,27 @@ def main():
                             excel_writer.write_confusion_matrix(exp_name, metrics['confusion_matrix'], short_name)
 
         print(f"Excel results saved to: {excel_path}")
+
+        # 누적 엑셀에도 기록 (모든 실험 결과를 하나의 파일에 계속 추가)
+        cumulative_path = "./cumulative_results.xlsx"
+        cumulative_writer = CumulativeExcelWriter(template_path, cumulative_path, classes=config.CLASSES)
+        print(f"\n[CumulativeExcel] Recording count before: {cumulative_writer.get_record_count()}")
+
+        for result in all_results:
+            if result['status'] == 'success' and 'full_metrics' in result:
+                exp_name = result['exp_name']
+                exp_config = result.get('config', {})
+                # 모든 best model 결과 저장 (auprc, auroc, recall)
+                for metric_name in ["macro_auprc", "macro_auroc", "macro_recall"]:
+                    if metric_name in result['full_metrics']:
+                        metrics = result['full_metrics'][metric_name]
+                        short_name = metric_name.replace("macro_", "")
+                        cumulative_writer.append_result(exp_name, metrics, exp_config, short_name)
+                        if 'confusion_matrix' in metrics:
+                            cumulative_writer.append_confusion_matrix(exp_name, metrics['confusion_matrix'], short_name)
+
+        print(f"[CumulativeExcel] Recording count after: {cumulative_writer.get_record_count()}")
+        print(f"Cumulative results saved to: {cumulative_path}")
 
     print(f"\nJSON results saved to: {results_path}")
 

@@ -299,7 +299,8 @@ def process_single_record(args) -> Tuple:
     x_filtered = remove_baseline_bandpass(x, fs=fs)
 
     r_peaks = ann.sample
-    rr_func = get_rr_feature_function(RR_FEATURE_OPTION)
+    # 기본 스타일은 항상 opt1 (7 features) 사용
+    rr_func = get_rr_feature_function("opt1")
     rr_features = rr_func(x_filtered, r_peaks, fs)
 
     pre = int(round(360 * fs / 360.0))
