@@ -68,18 +68,28 @@ def run_single_experiment(exp_config: dict, exp_name: str, data_loaders: dict, d
     Args:
         exp_config: 실험 설정 dict (MODEL_CONFIG에 병합됨)
         exp_name: 실험 이름
-        data_loaders: {"opt1": loaders, "opt2": loaders} 형태
+        data_loaders: {"opt1": loaders, "opt2": loaders, "opt3": loaders} 형태
         device: torch device
 
     Returns:
         결과 dict
     """
-    # Fusion 실험이면 opt1 데이터로더 사용
+    load_start = time.time()
+    
+    # 데이터로더 선택
     fusion_type = exp_config.get('fusion_type')
-    if fusion_type is not None and fusion_type.lower() != 'none':
+    is_opt3 = exp_config.get('use_opt3', False)
+    
+    if is_opt3:
+        loaders = data_loaders["opt3"]
+    elif fusion_type is not None and fusion_type.lower() != 'none':
         loaders = data_loaders["opt1"]
     else:
         loaders = data_loaders["opt2"]
+    
+    load_time = time.time() - load_start
+    if load_time > 0.1:
+        print(f"  [Load time: {load_time:.2f}s]")
 
     train_loader, valid_loader, test_loader = loaders
 
@@ -97,8 +107,12 @@ def run_single_experiment(exp_config: dict, exp_name: str, data_loaders: dict, d
     # 모델 설정 병합
     model_config = copy.deepcopy(config.MODEL_CONFIG)
 
+    # opt3는 lead=3 (early fusion) + fusion_type (late fusion) + rr_dim=7
+    if is_opt3:
+        # opt3는 이미 exp_config에 설정되어 있음
+        pass
     # Fusion 실험이면 opt1 설정 적용 (lead=1, rr_dim=7)
-    if fusion_type is not None and fusion_type.lower() != 'none':
+    elif fusion_type is not None and fusion_type.lower() != 'none':
         model_config.update({
             "lead": FUSION_EXP_CONFIG["lead"],
             "rr_dim": FUSION_EXP_CONFIG["rr_dim"],
@@ -184,7 +198,8 @@ def generate_experiments():
             exp_name = "baseline_opt2"
             experiments.append((exp_config, exp_name))
         elif fusion_type == "mhca":
-            # MHCA는 num_heads별로 실험 (opt1 style)
+            # MHCA는 num_heads별로 실험
+            # opt1 style (late fusion only)
             for num_heads in EXPERIMENT_GRID["fusion_num_heads"]:
                 exp_config = {
                     "fusion_type": fusion_type,
@@ -192,10 +207,32 @@ def generate_experiments():
                 }
                 exp_name = f"mhca_h{num_heads}"
                 experiments.append((exp_config, exp_name))
+            
+            # opt3 style (early + late fusion)
+            for num_heads in EXPERIMENT_GRID["fusion_num_heads"]:
+                exp_config = {
+                    "fusion_type": fusion_type,
+                    "fusion_num_heads": num_heads,
+                    "lead": 3,      # opt3: ECG + 2 RR channels (early fusion)
+                    "rr_dim": 7,    # opt3: 7 RR features (late fusion)
+                    "use_opt3": True,
+                }
+                exp_name = f"opt3_mhca_h{num_heads}"
+                experiments.append((exp_config, exp_name))
         else:
-            # concat, concat_proj: opt1 style (late fusion)
+            # concat, concat_proj: opt1 style (late fusion only)
             exp_config = {"fusion_type": fusion_type}
             exp_name = f"fusion_{fusion_type}"
+            experiments.append((exp_config, exp_name))
+            
+            # opt3 style (early + late fusion)
+            exp_config = {
+                "fusion_type": fusion_type,
+                "lead": 3,      # opt3: ECG + 2 RR channels (early fusion)
+                "rr_dim": 7,    # opt3: 7 RR features (late fusion)
+                "use_opt3": True,
+            }
+            exp_name = f"opt3_{fusion_type}"
             experiments.append((exp_config, exp_name))
 
     return experiments
@@ -265,13 +302,90 @@ def main():
         DataLoader(test_ds_opt1, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=config.NUM_WORKERS, pin_memory=True),
     )
 
-    print(f"  Train: {len(train_ds_opt2)} samples (opt2), {len(train_ds_opt1)} samples (opt1)")
-    print(f"  Valid: {len(valid_ds_opt2)} samples (opt2), {len(valid_ds_opt1)} samples (opt1)")
-    print(f"  Test:  {len(test_ds_opt2)} samples (opt2), {len(test_ds_opt1)} samples (opt1)")
+    # opt3 (Early fusion + Late fusion) - opt2 데이터 + opt1의 7차원 RR features
+    print("  Loading opt3 (Early+Late fusion) data...")
+    opt3_start = time.time()
+    
+    def match_rr_features_7d(opt2_data, opt1_data):
+        """opt2 샘플에 대해 opt1에서 같은 patient_id, sample_id를 가진 7차원 RR features를 찾아 매칭"""
+        opt2_pids = opt2_data[3]  # patient_ids
+        opt2_sids = opt2_data[4]  # sample_ids
+        opt1_pids = opt1_data[3]
+        opt1_sids = opt1_data[4]
+        opt1_rr_7d = opt1_data[2]  # 7차원 RR features
+        
+        # opt1에서 (patient_id, sample_id) -> index 매핑 생성
+        opt1_key_to_idx = {}
+        for idx, (pid, sid) in enumerate(zip(opt1_pids, opt1_sids)):
+            key = (int(pid), int(sid) if isinstance(sid, (int, np.integer)) else sid)
+            opt1_key_to_idx[key] = idx
+        
+        # opt2의 각 샘플에 대해 opt1에서 매칭된 7차원 RR features 찾기
+        matched_rr_7d = []
+        matched_indices = []
+        
+        for idx, (pid, sid) in enumerate(zip(opt2_pids, opt2_sids)):
+            key = (int(pid), int(sid) if isinstance(sid, (int, np.integer)) else sid)
+            if key in opt1_key_to_idx:
+                opt1_idx = opt1_key_to_idx[key]
+                matched_rr_7d.append(opt1_rr_7d[opt1_idx])
+                matched_indices.append(idx)
+            else:
+                # 매칭 실패 - 이 샘플은 제외
+                pass
+        
+        # 매칭된 샘플만 필터링
+        matched_data = opt2_data[0][matched_indices]
+        matched_labels = opt2_data[1][matched_indices]
+        matched_rr_2d = opt2_data[2][matched_indices]
+        matched_pids = opt2_data[3][matched_indices]
+        matched_sids = opt2_data[4][matched_indices]
+        
+        matched_rr_7d = np.array(matched_rr_7d)
+        
+        print(f"    Matched {len(matched_indices)}/{len(opt2_data[0])} samples")
+        
+        return (matched_data, matched_labels, matched_rr_2d, matched_rr_7d, matched_pids, matched_sids)
+    
+    # Train 데이터 매칭
+    train_opt3 = match_rr_features_7d(train_data_opt2, train_data_opt1)
+    valid_opt3 = match_rr_features_7d(valid_data_opt2, valid_data_opt1)
+    test_opt3 = match_rr_features_7d(test_data_opt2, test_data_opt1)
+    
+    DatasetClass_opt3 = DATASET_REGISTRY.get("opt3")
+    train_ds_opt3 = DatasetClass_opt3(*train_opt3)
+    valid_ds_opt3 = DatasetClass_opt3(*valid_opt3)
+    test_ds_opt3 = DatasetClass_opt3(*test_opt3)
+    
+    data_loaders["opt3"] = (
+        DataLoader(train_ds_opt3, batch_size=config.BATCH_SIZE, shuffle=True, num_workers=config.NUM_WORKERS, pin_memory=True),
+        DataLoader(valid_ds_opt3, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=config.NUM_WORKERS, pin_memory=True),
+        DataLoader(test_ds_opt3, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=config.NUM_WORKERS, pin_memory=True),
+    )
+    
+    opt3_time = time.time() - opt3_start
+    print(f"  [opt3 dataset creation: {opt3_time:.2f}s]")
+
+    print(f"  Train: {len(train_ds_opt2)} samples (opt2), {len(train_ds_opt1)} samples (opt1), {len(train_ds_opt3)} samples (opt3)")
+    print(f"  Valid: {len(valid_ds_opt2)} samples (opt2), {len(valid_ds_opt1)} samples (opt1), {len(valid_ds_opt3)} samples (opt3)")
+    print(f"  Test:  {len(test_ds_opt2)} samples (opt2), {len(test_ds_opt1)} samples (opt1), {len(test_ds_opt3)} samples (opt3)")
 
     # 실험 목록 생성
     experiments = generate_experiments()
     print(f"\n[2/3] Running {len(experiments)} experiments...")
+
+    # 엑셀 writer 초기화 (실험 시작 전에 미리 복사)
+    template_path = "./model_fusion.xlsx"
+    excel_writer = None
+    cumulative_writer = None
+
+    if os.path.exists(template_path):
+        excel_path = os.path.join(OUTPUT_DIR, "autoexp_results.xlsx")
+        excel_writer = ExcelResultWriter(template_path, excel_path, classes=config.CLASSES)
+
+        cumulative_path = "./cumulative_results.xlsx"
+        cumulative_writer = CumulativeExcelWriter(template_path, cumulative_path, classes=config.CLASSES)
+        print(f"[CumulativeExcel] Current record count: {cumulative_writer.get_record_count()}")
 
     # 실험 실행
     all_results = []
@@ -283,6 +397,26 @@ def main():
         try:
             result = run_single_experiment(exp_config, exp_name, data_loaders, device)
             all_results.append(result)
+
+            # 실험 완료 즉시 엑셀에 기록
+            if result['status'] == 'success' and 'full_metrics' in result:
+                for metric_name in ["macro_auprc", "macro_auroc", "macro_recall"]:
+                    if metric_name in result['full_metrics']:
+                        metrics = result['full_metrics'][metric_name]
+                        short_name = metric_name.replace("macro_", "")
+
+                        if excel_writer:
+                            excel_writer.write_metrics(exp_name, metrics, short_name)
+                            if 'confusion_matrix' in metrics:
+                                excel_writer.write_confusion_matrix(exp_name, metrics['confusion_matrix'], short_name)
+
+                        if cumulative_writer:
+                            cumulative_writer.append_result(exp_name, metrics, exp_config, short_name)
+                            if 'confusion_matrix' in metrics:
+                                cumulative_writer.append_confusion_matrix(exp_name, metrics['confusion_matrix'], short_name)
+
+                print(f"  [Excel] Results saved for {exp_name}")
+
         except Exception as e:
             print(f"  ERROR: {e}")
             all_results.append({
@@ -312,54 +446,12 @@ def main():
         else:
             print(f"{result['exp_name']:<20} FAILED")
 
-    # JSON 결과 저장
-    import json
-    results_path = os.path.join(OUTPUT_DIR, "results_summary.json")
-    with open(results_path, 'w') as f:
-        json.dump(all_results, f, indent=2, default=str)
-
-    # 엑셀 결과 저장 (템플릿이 있는 경우)
-    template_path = "./model_fusion.xlsx"
-    if os.path.exists(template_path):
-        excel_path = os.path.join(OUTPUT_DIR, "autoexp_results.xlsx")
-        excel_writer = ExcelResultWriter(template_path, excel_path, classes=config.CLASSES)
-
-        for result in all_results:
-            if result['status'] == 'success' and 'full_metrics' in result:
-                exp_name = result['exp_name']
-                # 모든 best model 결과 저장 (auprc, auroc, recall)
-                for metric_name in ["macro_auprc", "macro_auroc", "macro_recall"]:
-                    if metric_name in result['full_metrics']:
-                        metrics = result['full_metrics'][metric_name]
-                        short_name = metric_name.replace("macro_", "")  # auprc, auroc, recall
-                        excel_writer.write_metrics(exp_name, metrics, short_name)
-                        if 'confusion_matrix' in metrics:
-                            excel_writer.write_confusion_matrix(exp_name, metrics['confusion_matrix'], short_name)
-
-        print(f"Excel results saved to: {excel_path}")
-
-        # 누적 엑셀에도 기록 (모든 실험 결과를 하나의 파일에 계속 추가)
-        cumulative_path = "./cumulative_results.xlsx"
-        cumulative_writer = CumulativeExcelWriter(template_path, cumulative_path, classes=config.CLASSES)
-        print(f"\n[CumulativeExcel] Recording count before: {cumulative_writer.get_record_count()}")
-
-        for result in all_results:
-            if result['status'] == 'success' and 'full_metrics' in result:
-                exp_name = result['exp_name']
-                exp_config = result.get('config', {})
-                # 모든 best model 결과 저장 (auprc, auroc, recall)
-                for metric_name in ["macro_auprc", "macro_auroc", "macro_recall"]:
-                    if metric_name in result['full_metrics']:
-                        metrics = result['full_metrics'][metric_name]
-                        short_name = metric_name.replace("macro_", "")
-                        cumulative_writer.append_result(exp_name, metrics, exp_config, short_name)
-                        if 'confusion_matrix' in metrics:
-                            cumulative_writer.append_confusion_matrix(exp_name, metrics['confusion_matrix'], short_name)
-
-        print(f"[CumulativeExcel] Recording count after: {cumulative_writer.get_record_count()}")
-        print(f"Cumulative results saved to: {cumulative_path}")
-
-    print(f"\nJSON results saved to: {results_path}")
+    # 최종 요약 출력
+    if excel_writer:
+        print(f"\nExcel results saved to: {os.path.join(OUTPUT_DIR, 'autoexp_results.xlsx')}")
+    if cumulative_writer:
+        print(f"\nCumulative results saved to: ./cumulative_results.xlsx")
+        print(f"[CumulativeExcel] Final record count: {cumulative_writer.get_record_count()}")
 
 
 if __name__ == '__main__':

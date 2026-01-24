@@ -68,58 +68,142 @@ class DAEACDataset(Dataset):
     """
 
     def __init__(self, data, labels, rr_features, patient_ids, sample_ids):
-        self.data = np.asarray(data, dtype=np.float32)
-        self.labels = np.asarray(labels, dtype=np.int64)
-        self.rr_features = np.asarray(rr_features, dtype=np.float32)
-        self.patient_ids = np.asarray(patient_ids, dtype=np.int64)
-        self.sample_ids = np.asarray(sample_ids)
-        self.seq_len = data.shape[1]
+        data = np.asarray(data, dtype=np.float32)
+        labels = np.asarray(labels, dtype=np.int64)
+        rr_features = np.asarray(rr_features, dtype=np.float32)
+        patient_ids = np.asarray(patient_ids, dtype=np.int64)
+        sample_ids = np.asarray(sample_ids, dtype=np.int64)
+
+        seq_len = data.shape[1]
+        n_samples = len(data)
 
         # Validate rr_features shape
-        self._validate_rr_features()
+        self._validate_rr_features(rr_features, labels)
 
-    def _validate_rr_features(self):
+        # 사전 계산: RR features를 ECG 길이로 repeat하여 3채널 데이터 생성
+        # (N, L), (N, L), (N, L) -> (N, 3, L) -> (N, 1, 3, L)
+        pre_rr_expanded = np.broadcast_to(
+            rr_features[:, 0:1], (n_samples, seq_len)
+        ).astype(np.float32)
+        near_pre_rr_expanded = np.broadcast_to(
+            rr_features[:, 1:2], (n_samples, seq_len)
+        ).astype(np.float32)
+
+        # Stack and add channel dimension: (N, 1, 3, L)
+        x_data = np.stack([data, pre_rr_expanded, near_pre_rr_expanded], axis=1)
+        x_data = x_data[:, np.newaxis, :, :]
+
+        # 미리 torch tensor로 변환 (한 번만)
+        self.x_tensor = torch.from_numpy(x_data)
+        self.labels_tensor = torch.from_numpy(labels)
+        self.rr_tensor = torch.from_numpy(rr_features)
+        self.patient_ids_tensor = torch.from_numpy(patient_ids)
+        self.sample_ids_tensor = torch.from_numpy(sample_ids)
+
+        # 기존 인터페이스 호환성을 위한 alias
+        self.labels = self.labels_tensor
+
+    def _validate_rr_features(self, rr_features, labels):
         """RR features shape 검증"""
-        if self.rr_features.ndim != 2:
+        if rr_features.ndim != 2:
             raise ValueError(
                 f"Expected rr_features to be 2D (n_samples, 2), "
-                f"got {self.rr_features.ndim}D with shape {self.rr_features.shape}"
+                f"got {rr_features.ndim}D with shape {rr_features.shape}"
             )
-        if self.rr_features.shape[1] != 2:
+        if rr_features.shape[1] != 2:
             raise ValueError(
                 f"Expected rr_features to have 2 columns, "
-                f"got shape {self.rr_features.shape}"
+                f"got shape {rr_features.shape}"
             )
-        if len(self.rr_features) != len(self.labels):
+        if len(rr_features) != len(labels):
             raise ValueError(
-                f"rr_features length ({len(self.rr_features)}) != "
-                f"labels length ({len(self.labels)})"
+                f"rr_features length ({len(rr_features)}) != "
+                f"labels length ({len(labels)})"
             )
 
     def __len__(self):
-        return len(self.labels)
+        return len(self.labels_tensor)
 
     def __getitem__(self, idx):
-        # ECG segment
-        ecg = self.data[idx]  # (L,)
-
-        # RR features
-        rr = self.rr_features[idx]  # (2,)
-
-        # RR features를 ECG 길이로 repeat
-        pre_rr_ratio = np.full(self.seq_len, rr[0], dtype=np.float32)
-        near_pre_rr_ratio = np.full(self.seq_len, rr[1], dtype=np.float32)
-
-        # Stack to (3, L) → (1, 3, L)
-        x = np.stack([ecg, pre_rr_ratio, near_pre_rr_ratio], axis=0)
-        x = x[np.newaxis, :, :]  # (1, 3, L)
-
+        # 단순 인덱싱만 - 연산 없음
         return (
-            torch.from_numpy(x),                          # (1, 3, L)
-            torch.tensor(self.labels[idx], dtype=torch.long),
-            torch.from_numpy(rr),                         # (2,)
-            torch.tensor(self.patient_ids[idx], dtype=torch.long),
-            torch.tensor(self.sample_ids[idx], dtype=torch.long),
+            self.x_tensor[idx],           # (1, 3, L)
+            self.labels_tensor[idx],      # scalar
+            self.rr_tensor[idx],          # (2,)
+            self.patient_ids_tensor[idx], # scalar
+            self.sample_ids_tensor[idx],  # scalar
+        )
+
+
+@DATASET_REGISTRY.register("opt3")
+class Opt3Dataset(Dataset):
+    """
+    Opt3 Dataset: Early fusion (3D input) + Late fusion (7D RR features)
+    
+    opt2처럼 3D 입력 (ECG + 2 RR ratios)을 사용하되,
+    추가로 7차원 RR features를 late fusion으로 결합합니다.
+    
+    Args:
+        data: (N, L) ECG segments
+        labels: (N,) class labels
+        rr_features_2d: (N, 2) RR features for early fusion [pre_rr_ratio, near_pre_rr_ratio]
+        rr_features_7d: (N, 7) RR features for late fusion
+        patient_ids: (N,) patient IDs
+        sample_ids: (N,) sample indices
+    """
+    
+    def __init__(self, data, labels, rr_features_2d, rr_features_7d, patient_ids, sample_ids):
+        data = np.asarray(data, dtype=np.float32)
+        labels = np.asarray(labels, dtype=np.int64)
+        rr_features_2d = np.asarray(rr_features_2d, dtype=np.float32)
+        rr_features_7d = np.asarray(rr_features_7d, dtype=np.float32)
+        patient_ids = np.asarray(patient_ids, dtype=np.int64)
+        sample_ids = np.asarray(sample_ids, dtype=np.int64)
+
+        seq_len = data.shape[1]
+        n_samples = len(data)
+
+        # Validate shapes
+        if rr_features_2d.shape[1] != 2:
+            raise ValueError(f"Expected rr_features_2d to have 2 columns, got {rr_features_2d.shape}")
+        if rr_features_7d.shape[1] != 7:
+            raise ValueError(f"Expected rr_features_7d to have 7 columns, got {rr_features_7d.shape}")
+        if len(rr_features_2d) != len(labels) or len(rr_features_7d) != len(labels):
+            raise ValueError("RR features length must match labels length")
+
+        # 사전 계산: RR features를 ECG 길이로 repeat하여 3채널 데이터 생성
+        pre_rr_expanded = np.broadcast_to(
+            rr_features_2d[:, 0:1], (n_samples, seq_len)
+        ).astype(np.float32)
+        near_pre_rr_expanded = np.broadcast_to(
+            rr_features_2d[:, 1:2], (n_samples, seq_len)
+        ).astype(np.float32)
+
+        # Stack and add channel dimension: (N, 1, 3, L)
+        x_data = np.stack([data, pre_rr_expanded, near_pre_rr_expanded], axis=1)
+        x_data = x_data[:, np.newaxis, :, :]
+
+        # 미리 torch tensor로 변환 (한 번만)
+        self.x_tensor = torch.from_numpy(x_data)
+        self.labels_tensor = torch.from_numpy(labels)
+        self.rr_7d_tensor = torch.from_numpy(rr_features_7d)
+        self.patient_ids_tensor = torch.from_numpy(patient_ids)
+        self.sample_ids_tensor = torch.from_numpy(sample_ids)
+
+        # 기존 인터페이스 호환성을 위한 alias
+        self.labels = self.labels_tensor
+
+    def __len__(self):
+        return len(self.labels_tensor)
+
+    def __getitem__(self, idx):
+        # 단순 인덱싱만 - 연산 없음
+        return (
+            self.x_tensor[idx],           # (1, 3, L) - early fusion input
+            self.labels_tensor[idx],      # scalar
+            self.rr_7d_tensor[idx],       # (7,) - late fusion RR features
+            self.patient_ids_tensor[idx], # scalar
+            self.sample_ids_tensor[idx],  # scalar
         )
 
 

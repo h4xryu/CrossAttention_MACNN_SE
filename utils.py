@@ -674,13 +674,22 @@ class FocalLoss(nn.Module):
 # Dataset Caching System
 # =============================================================================
 
-def _compute_cache_hash(record_list: list, out_len: int, valid_leads: list) -> str:
+def _compute_cache_hash(record_list: list, out_len: int, valid_leads: list, extraction_style: str = "default") -> str:
     """record 리스트, out_len, leads, RR option을 기반으로 고유 해시 생성"""
+    # extraction_style에 따라 RR 옵션 결정
+    # default 스타일은 항상 opt1 (7 features) 사용
+    # daeac 스타일은 config의 RR_FEATURE_OPTION 사용
+    if extraction_style == "default":
+        rr_option = "opt1"
+    else:
+        rr_option = RR_FEATURE_OPTION
+    
     cache_key = {
         'records': sorted(record_list),
         'out_len': out_len,
         'valid_leads': valid_leads,
-        'rr_option': RR_FEATURE_OPTION,
+        'rr_option': rr_option,
+        'extraction_style': extraction_style,
     }
     key_str = json.dumps(cache_key, sort_keys=True)
     return hashlib.md5(key_str.encode()).hexdigest()[:12]
@@ -700,7 +709,7 @@ def _get_cache_paths(split_name: str, cache_hash: str, cache_dir: str = CACHE_DI
     }
 
 
-def _is_cache_valid(cache_paths: dict, record_list: list, out_len: int) -> bool:
+def _is_cache_valid(cache_paths: dict, record_list: list, out_len: int, extraction_style: str = "default") -> bool:
     """캐시 유효성 검사"""
     # 파일 존재 확인
     for key, path in cache_paths.items():
@@ -711,6 +720,15 @@ def _is_cache_valid(cache_paths: dict, record_list: list, out_len: int) -> bool:
         # 메타데이터 로드 및 비교
         with open(cache_paths['meta'], 'r') as f:
             meta = json.load(f)
+
+        # extraction_style 확인 (기존 캐시에 없으면 무효 처리)
+        cached_style = meta.get('extraction_style')
+        if cached_style is None:
+            print(f"  Cache invalid: extraction_style not found in metadata (old cache format)")
+            return False
+        if cached_style != extraction_style:
+            print(f"  Cache invalid: extraction_style mismatch ({cached_style} vs {extraction_style})")
+            return False
 
         # record 리스트 일치 확인
         if sorted(meta.get('records', [])) != sorted(record_list):
@@ -735,8 +753,12 @@ def _is_cache_valid(cache_paths: dict, record_list: list, out_len: int) -> bool:
         # RR feature dimension 확인
         rr_sample = np.load(cache_paths['rr'], mmap_mode='r')
         if len(rr_sample) > 0:
-            # For DAEAC style, rr should be 2D with 2 columns
-            expected_rr_dim = meta.get('rr_dim', 7)
+            # extraction_style에 따라 예상 차원 결정
+            if extraction_style == "default":
+                expected_rr_dim = 7  # opt1
+            else:
+                expected_rr_dim = 2  # opt2 (daeac)
+            
             if rr_sample.ndim != 2:
                 print(f"  Cache invalid: RR array should be 2D, got {rr_sample.ndim}D")
                 return False
@@ -751,7 +773,7 @@ def _is_cache_valid(cache_paths: dict, record_list: list, out_len: int) -> bool:
         return False
 
 
-def _save_cache(cache_paths: dict, data: tuple, record_list: list, out_len: int, rr_dim: int):
+def _save_cache(cache_paths: dict, data: tuple, record_list: list, out_len: int, rr_dim: int, extraction_style: str = "default"):
     """데이터셋을 numpy 파일로 저장"""
     data_arr, labels_arr, rr_arr, patient_ids, sample_ids = data
 
@@ -766,6 +788,7 @@ def _save_cache(cache_paths: dict, data: tuple, record_list: list, out_len: int,
         'records': sorted(record_list),
         'out_len': out_len,
         'rr_dim': rr_dim,
+        'extraction_style': extraction_style,
         'n_samples': len(data_arr),
         'data_shape': list(data_arr.shape),
         'rr_shape': list(rr_arr.shape),
@@ -818,16 +841,14 @@ def load_or_extract_data(
         (data, labels, rr_features, patient_ids, sample_ids)
     """
     # extraction_style을 캐시 해시에 포함
-    cache_hash = _compute_cache_hash(record_list, out_len, valid_leads)
-    if extraction_style == "daeac":
-        cache_hash = cache_hash + "_daeac"
+    cache_hash = _compute_cache_hash(record_list, out_len, valid_leads, extraction_style)
 
     cache_paths = _get_cache_paths(split_name, cache_hash, cache_dir)
 
     print(f"\n[{split_name}] Cache check (hash: {cache_hash}, style: {extraction_style})")
 
     # 캐시 유효성 검사
-    if not force_reprocess and _is_cache_valid(cache_paths, record_list, out_len):
+    if not force_reprocess and _is_cache_valid(cache_paths, record_list, out_len, extraction_style):
         print(f"  Loading from cache...")
         data, labels, rr, patient_ids, sample_ids = _load_cache(cache_paths)
         print(f"  Loaded {len(data)} samples from cache")
@@ -865,6 +886,6 @@ def load_or_extract_data(
     if len(data) > 0:
         rr_dim = rr.shape[1] if len(rr.shape) > 1 else 0
         _save_cache(cache_paths, (data, labels, rr, patient_ids, sample_ids),
-                   record_list, out_len, rr_dim)
+                   record_list, out_len, rr_dim, extraction_style)
 
     return data, labels, rr, patient_ids, sample_ids

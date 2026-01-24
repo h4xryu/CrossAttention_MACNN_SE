@@ -181,8 +181,8 @@ SCHEDULER_CONFIG = {
 # 10. 학습 설정
 # =============================================================================
 EPOCHS = 5
-BATCH_SIZE = 256
-NUM_WORKERS = 4
+BATCH_SIZE = 256  * 1000 # 25,600 → 256으로 축소 (데이터 로딩 병목 해소)
+NUM_WORKERS = 4   # 9 → 4로 축소 (IPC 오버헤드 감소)
 PIN_MEMORY = True
 
 # Gradient clipping (None이면 사용 안함)

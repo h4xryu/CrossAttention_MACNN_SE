@@ -108,8 +108,16 @@ class Trainer:
         total_loss = 0.0
         correct = 0
         total = 0
+        
+        # Timing
+        data_time = 0.0
+        forward_time = 0.0
+        backward_time = 0.0
+        batch_start = time.time()
 
-        for batch in self.train_loader:
+        for i, batch in enumerate(self.train_loader):
+            data_time += time.time() - batch_start
+            batch_start = time.time()
             # Unpack batch: (ecg, label, rr, pid, sid)
             ecg, labels, rr_features, *_ = batch
             ecg = ecg.to(self.device)
@@ -118,12 +126,15 @@ class Trainer:
 
             # Forward
             self.optimizer.zero_grad()
+            forward_start = time.time()
             logits, _ = self.model(ecg, rr_features)
+            forward_time += time.time() - forward_start
 
             # Loss
             loss = self.criterion(logits, labels)
 
             # Backward
+            backward_start = time.time()
             loss.backward()
 
             # Gradient clipping
@@ -135,6 +146,7 @@ class Trainer:
             # Step scheduler (if per-iteration)
             if self.scheduler is not None:
                 self.scheduler.step()
+            backward_time += time.time() - backward_start
 
             # Simple accuracy (no sklearn overhead)
             preds = torch.argmax(logits, dim=1)
@@ -142,6 +154,20 @@ class Trainer:
             total += labels.size(0)
 
             total_loss += loss.item()
+            
+            batch_start = time.time()
+            
+            # Print timing breakdown every 20 batches (more frequent for debugging)
+            if (i + 1) % 20 == 0:
+                avg_data = data_time / (i + 1)
+                avg_forward = forward_time / (i + 1)
+                avg_backward = backward_time / (i + 1)
+                total_batch_time = avg_data + avg_forward + avg_backward
+                print(f"  [Batch {i+1}/{len(self.train_loader)}] "
+                      f"Data: {avg_data*1000:.1f}ms, "
+                      f"Forward: {avg_forward*1000:.1f}ms, "
+                      f"Backward: {avg_backward*1000:.1f}ms, "
+                      f"Total: {total_batch_time*1000:.1f}ms")
 
         avg_loss = total_loss / len(self.train_loader)
         acc = correct / total
@@ -159,7 +185,7 @@ class Trainer:
     @torch.no_grad()
     def validate(self, loader: DataLoader = None) -> Tuple[float, Dict[str, Any]]:
         """
-        Validate on given loader.
+        Validate on given loader - calculates accuracy, AUPRC, and AUROC.
 
         Args:
             loader: DataLoader (default: self.valid_loader)
@@ -171,7 +197,10 @@ class Trainer:
         self.model.eval()
 
         total_loss = 0.0
-        all_preds, all_labels, all_probs = [], [], []
+        correct = 0
+        total = 0
+        all_labels = []
+        all_probs = []
 
         for batch in loader:
             ecg, labels, rr_features, *_ = batch
@@ -182,21 +211,40 @@ class Trainer:
             logits, _ = self.model(ecg, rr_features)
             loss = self.criterion(logits, labels)
 
+            # Calculate probabilities for AUPRC/AUROC
             probs = torch.softmax(logits, dim=1)
             preds = torch.argmax(logits, dim=1)
-
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
+            
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
+            
+            # Collect for metrics calculation
+            all_labels.append(labels.cpu().numpy())
             all_probs.append(probs.cpu().numpy())
 
             total_loss += loss.item()
 
-        all_labels = np.array(all_labels)
-        all_preds = np.array(all_preds)
-        all_probs = np.concatenate(all_probs, axis=0)
-
-        metrics = self._calculate_metrics(all_labels, all_preds, all_probs)
+        acc = correct / total if total > 0 else 0.0
         avg_loss = total_loss / len(loader)
+
+        # Calculate AUPRC and AUROC
+        all_labels = np.concatenate(all_labels)
+        all_probs = np.concatenate(all_probs, axis=0)
+        macro_auprc, macro_auroc = self._calculate_auc_metrics(all_labels, all_probs, all_probs.shape[1])
+        
+        # Calculate macro_recall for best model selection
+        all_preds = all_probs.argmax(axis=1)
+        _, macro_recall, _, _ = precision_recall_fscore_support(
+            all_labels, all_preds, average='macro', zero_division=0
+        )
+
+        metrics = {
+            'acc': acc,
+            'macro_f1': 0.0,  # placeholder (not needed for best model selection)
+            'macro_auprc': macro_auprc,
+            'macro_auroc': macro_auroc,
+            'macro_recall': macro_recall,
+        }
 
         return avg_loss, metrics
 
@@ -228,19 +276,25 @@ class Trainer:
             epoch_start = time.time()
 
             # Train
+            train_start = time.time()
             train_loss, train_metrics = self.train_one_epoch()
+            train_time = time.time() - train_start
             self.history['train'].append({'loss': train_loss, **train_metrics})
 
             # Validate
+            valid_start = time.time()
             valid_loss, valid_metrics = self.validate()
+            valid_time = time.time() - valid_start
             self.history['valid'].append({'loss': valid_loss, **valid_metrics})
 
-            # Print epoch summary
+            epoch_time = time.time() - epoch_start
+
+            # Print epoch summary with timing breakdown
             self._print_epoch_summary(
                 epoch, epochs,
                 train_loss, train_metrics,
                 valid_loss, valid_metrics,
-                time.time() - epoch_start
+                epoch_time, train_time, valid_time
             )
 
             # Update best models
@@ -273,16 +327,47 @@ class Trainer:
 
     def evaluate(self, loader: DataLoader) -> Dict[str, Any]:
         """
-        Evaluate model on test set.
+        Evaluate model on test set with full metrics.
 
         Args:
             loader: Test data loader
 
         Returns:
-            Metrics dictionary
+            Full metrics dictionary including per-class, confusion matrix
         """
-        loss, metrics = self.validate(loader)
-        metrics['loss'] = loss
+        self.model.eval()
+
+        total_loss = 0.0
+        all_labels = []
+        all_probs = []
+
+        with torch.no_grad():
+            for batch in loader:
+                ecg, labels, rr_features, *_ = batch
+                ecg = ecg.to(self.device)
+                labels = labels.to(self.device)
+                rr_features = rr_features.to(self.device)
+
+                logits, _ = self.model(ecg, rr_features)
+                loss = self.criterion(logits, labels)
+
+                probs = torch.softmax(logits, dim=1)
+
+                all_labels.append(labels.cpu().numpy())
+                all_probs.append(probs.cpu().numpy())
+                total_loss += loss.item()
+
+        avg_loss = total_loss / len(loader)
+
+        # Concatenate all results
+        y_true = np.concatenate(all_labels)
+        y_prob = np.concatenate(all_probs, axis=0)
+        y_pred = y_prob.argmax(axis=1)
+
+        # Calculate full metrics using _calculate_metrics
+        metrics = self._calculate_metrics(y_true, y_pred, y_prob)
+        metrics['loss'] = avg_loss
+
         return metrics
 
     def _calculate_metrics(
@@ -298,10 +383,21 @@ class Trainer:
         acc = accuracy_score(y_true, y_pred)
         cm = confusion_matrix(y_true, y_pred, labels=range(num_classes))
 
-        # Per-class accuracy
-        per_class_acc = cm.diagonal() / (cm.sum(axis=1) + 1e-8)
+        # Per-class accuracy (TP + TN) / Total
+        per_class_acc = np.zeros(num_classes)
+        for i in range(num_classes):
+            tp = cm[i, i]
+            tn = np.sum(cm) - np.sum(cm[i, :]) - np.sum(cm[:, i]) + cm[i, i]
+            per_class_acc[i] = (tp + tn) / np.sum(cm)
 
-        # Precision, Recall, F1
+        # Per-class specificity: TN / (TN + FP)
+        per_class_specificity = np.zeros(num_classes)
+        for i in range(num_classes):
+            tn = np.sum(cm) - np.sum(cm[i, :]) - np.sum(cm[:, i]) + cm[i, i]
+            fp = np.sum(cm[:, i]) - cm[i, i]
+            per_class_specificity[i] = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+
+        # Precision, Recall, F1 (per-class and macro)
         prec, recall, f1, _ = precision_recall_fscore_support(
             y_true, y_pred, average=None, zero_division=0
         )
@@ -309,20 +405,47 @@ class Trainer:
             y_true, y_pred, average='macro', zero_division=0
         )
 
+        # Weighted metrics
+        weighted_prec, weighted_recall, weighted_f1, _ = precision_recall_fscore_support(
+            y_true, y_pred, average='weighted', zero_division=0
+        )
+
+        # Class weights for weighted averaging
+        class_counts = np.bincount(y_true, minlength=num_classes)
+        class_weights = class_counts / len(y_true)
+
+        # Macro and weighted specificity/accuracy
+        macro_specificity = np.mean(per_class_specificity)
+        weighted_specificity = np.sum(per_class_specificity * class_weights)
+        macro_accuracy = np.mean(per_class_acc)
+        weighted_accuracy = np.sum(per_class_acc * class_weights)
+
         # AUPRC and AUROC
         macro_auprc, macro_auroc = self._calculate_auc_metrics(y_true, y_prob, num_classes)
 
         return {
             'acc': acc,
+            # Per-class metrics
             'per_class_acc': per_class_acc,
             'per_class_precision': prec,
             'per_class_recall': recall,
+            'per_class_specificity': per_class_specificity,
             'per_class_f1': f1,
+            # Macro metrics
+            'macro_accuracy': macro_accuracy,
             'macro_precision': macro_prec,
             'macro_recall': macro_recall,
+            'macro_specificity': macro_specificity,
             'macro_f1': macro_f1,
             'macro_auprc': macro_auprc,
             'macro_auroc': macro_auroc,
+            # Weighted metrics
+            'weighted_accuracy': weighted_accuracy,
+            'weighted_precision': weighted_prec,
+            'weighted_recall': weighted_recall,
+            'weighted_specificity': weighted_specificity,
+            'weighted_f1': weighted_f1,
+            # Confusion matrix
             'confusion_matrix': cm,
         }
 
@@ -396,7 +519,7 @@ class Trainer:
 
     def load_checkpoint(self, path: str):
         """Load model checkpoint."""
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
 
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -413,7 +536,7 @@ class Trainer:
         """Load best model for given metric."""
         path = os.path.join(self.best_model_dir, f'best_{metric}.pth')
         if os.path.exists(path):
-            checkpoint = torch.load(path, map_location=self.device)
+            checkpoint = torch.load(path, map_location=self.device, weights_only=False)
             self.model.load_state_dict(checkpoint['model_state_dict'])
             print(f"Loaded best model (best {metric})")
         else:
@@ -427,16 +550,20 @@ class Trainer:
         train_metrics: Dict,
         valid_loss: float,
         valid_metrics: Dict,
-        elapsed: float
+        elapsed: float,
+        train_time: float = None,
+        valid_time: float = None
     ):
         """Print epoch summary."""
         lr = self.optimizer.param_groups[0]['lr']
 
         print(f"\nEpoch {epoch}/{total_epochs} ({elapsed:.1f}s) | LR: {lr:.6f}")
+        if train_time is not None and valid_time is not None:
+            print(f"  [Timing] Train: {train_time:.1f}s, Valid: {valid_time:.1f}s, Other: {elapsed-train_time-valid_time:.1f}s")
         print("-" * 60)
         print(f"  Train | Loss: {train_loss:.4f} | Acc: {train_metrics['acc']:.4f}")
         print(f"  Valid | Loss: {valid_loss:.4f} | Acc: {valid_metrics['acc']:.4f} | "
-              f"F1: {valid_metrics['macro_f1']:.4f} | AUPRC: {valid_metrics['macro_auprc']:.4f} | AUROC: {valid_metrics['macro_auroc']:.4f}")
+              f"AUPRC: {valid_metrics['macro_auprc']:.4f} | AUROC: {valid_metrics['macro_auroc']:.4f}")
 
     def _print_best_models(self):
         """Print best model summary."""
