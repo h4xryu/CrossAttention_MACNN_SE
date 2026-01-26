@@ -50,8 +50,9 @@ FUSION_EXP_CONFIG = {
     "rr_feature_option": "opt1",
 }
 
+
 # 실험별 epochs (빠른 실험용)
-EXP_EPOCHS = 20
+EXP_EPOCHS = 40
 
 # 결과 저장 경로
 OUTPUT_DIR = "./autoexp_results/"
