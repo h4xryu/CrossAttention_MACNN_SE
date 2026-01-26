@@ -16,10 +16,10 @@ from src.utils import ExcelResultWriter
 from utils import set_seed, load_or_extract_data
 
 # 실험 결과 디렉토리
-RESULTS_DIR = "/home/work/Ryuha/autoexp_results/20260124_144222"
+RESULTS_DIR = "/home/work/Ryuha/autoexp_results_backbone/20260126_155452"
 
 # 엑셀 저장 경로
-EXCEL_PATH = "/home/work/Ryuha/ECG_CrossAttention-stored/model_fusion_results_full.xlsx"
+EXCEL_PATH = "/home/work/Ryuha/ECG_CrossAttention-stored/model_fusion_results_batch.xlsx"
 TEMPLATE_PATH = "/home/work/Ryuha/ECG_CrossAttention-stored/model_fusion.xlsx"
 
 # 실험 설정 (main_autoexp.py와 동일)
@@ -270,8 +270,8 @@ def main():
             all_results[exp_name] = results
 
             # best_macro_auprc 기준으로 Excel 저장
-            if "macro_auroc" in results:
-                metrics = results["macro_auroc"]
+            if "macro_auprc" in results:
+                metrics = results["macro_auprc"]
                 short_name = exp_name
                 excel_writer.write_metrics(exp_name, metrics, short_name)
                 if 'confusion_matrix' in metrics:

@@ -35,11 +35,11 @@ from utils import set_seed, load_or_extract_data
 # 실험할 파라미터 그리드
 EXPERIMENT_GRID = {
     # Fusion type 실험 (opt1, lead=1일 때만 의미있음)
-    "fusion_type": [None, "concat", "concat_proj", "mhca"],
-    # "fusion_type": ["mhca"],
+    "fusion_type": ["mhca"],
+    # "fusion_type": [None],
 
     # MHCA용 num_heads (fusion_type="mhca"일 때만 사용)
-    "fusion_num_heads": [1, 2, 4, 8],
+    "fusion_num_heads": [1,2],
 }
 
 # Fusion 실험용 설정 (late fusion은 opt1 스타일 필요)
@@ -52,10 +52,10 @@ FUSION_EXP_CONFIG = {
 
 
 # 실험별 epochs (빠른 실험용)
-EXP_EPOCHS = 40
+EXP_EPOCHS = 50
 
 # 결과 저장 경로
-OUTPUT_DIR = "./autoexp_results/"
+OUTPUT_DIR = "./autoexp_results_202602/"
 
 
 # =============================================================================

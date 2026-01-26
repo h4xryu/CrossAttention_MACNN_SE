@@ -41,9 +41,8 @@ def set_seed(seed: int, fully_deterministic: bool = True) -> None:
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
 
-    # 기본 cuDNN 설정
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
 
 
 # =============================================================================

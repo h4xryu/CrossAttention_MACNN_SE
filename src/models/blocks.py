@@ -360,7 +360,7 @@ class MultiHeadCrossAttentionFusion(nn.Module):
 
     def __init__(
         self,
-        emb_dim: int = 64,
+        emb_dim: int = 128,
         expansion: int = 2,
         rr_dim: int = 7,
         num_heads: int = 1,
@@ -373,7 +373,7 @@ class MultiHeadCrossAttentionFusion(nn.Module):
         self.emb_dim = emb_dim
         self.rr_dim = rr_dim
         self.num_heads = num_heads
-        self.out_dim = 2 * emb_dim  # 🔴 핵심 수정
+        self.out_dim = 2 * emb_dim 
 
         # RR → Query projection
         self.rr_proj = nn.Sequential(
