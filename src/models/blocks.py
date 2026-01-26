@@ -361,7 +361,7 @@ class MultiHeadCrossAttentionFusion(nn.Module):
     def __init__(
         self,
         emb_dim: int = 128,
-        expansion: int = 2,
+        expansion: int = 3,
         rr_dim: int = 7,
         num_heads: int = 1,
         **kwargs
