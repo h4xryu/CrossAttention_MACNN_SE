@@ -270,8 +270,8 @@ def main():
             all_results[exp_name] = results
 
             # best_macro_auprc 기준으로 Excel 저장
-            if "macro_auprc" in results:
-                metrics = results["macro_auprc"]
+            if "macro_auroc" in results:
+                metrics = results["macro_auroc"]
                 short_name = exp_name
                 excel_writer.write_metrics(exp_name, metrics, short_name)
                 if 'confusion_matrix' in metrics:
