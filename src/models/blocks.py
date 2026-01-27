@@ -440,7 +440,7 @@ class MultiHeadCrossAttentionFusion(nn.Module):
         self.norm2 = nn.LayerNorm(emb_dim)
 
         # ------------------------------------------------------------
-        # ⭐ Channel-wise Gate parameter alpha
+        # Channel-wise Gate parameter alpha
         # ------------------------------------------------------------
         # alpha ∈ R^{emb_dim}
         # sigmoid(alpha_i) ∈ (0,1)
@@ -490,13 +490,13 @@ class MultiHeadCrossAttentionFusion(nn.Module):
         attn_out = self.norm2(attn_out + self.ffn(attn_out))
 
         # ------------------------------------------------------------
-        # ⭐ Channel-wise Gate scaling
+        # Channel-wise Gate scaling
         # ------------------------------------------------------------
         gate = torch.sigmoid(self.alpha)  # (emb_dim,)
         attn_out = attn_out * gate.unsqueeze(0)  # (B,emb)
 
         # ------------------------------------------------------------
-        # ✅ Final Fusion (Concat 유지)
+        # Final Fusion (Concat 유지)
         # ------------------------------------------------------------
         fused = torch.cat([x_pool, attn_out], dim=1)  # (B,2emb)
 

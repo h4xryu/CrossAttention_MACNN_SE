@@ -22,11 +22,13 @@ Trainer Class
 """
 
 import os
+os.environ["TENSORBOARD_NO_TF"] = "1"
 import time
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from typing import Dict, List, Optional, Tuple, Any
 from sklearn.metrics import (
@@ -96,6 +98,10 @@ class Trainer:
         self.best_model_dir = os.path.join(exp_dir, 'best_models')
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         os.makedirs(self.best_model_dir, exist_ok=True)
+
+        # TensorBoard Logger
+        self.log_dir = os.path.join(exp_dir, 'runs')
+        self.writer = SummaryWriter(log_dir=self.log_dir)
 
     def train_one_epoch(self) -> Tuple[float, Dict[str, Any]]:
         """
@@ -297,6 +303,11 @@ class Trainer:
                 epoch_time, train_time, valid_time
             )
 
+            # TensorBoard logging
+            current_lr = self.optimizer.param_groups[0]['lr']
+            self._log_epoch(epoch, train_loss, train_metrics, current_lr, phase='train')
+            self._log_epoch(epoch, valid_loss, valid_metrics, current_lr, phase='valid')
+
             # Update best models
             self._update_best_models(valid_metrics)
 
@@ -319,6 +330,9 @@ class Trainer:
         # Save final model
         final_path = os.path.join(self.checkpoint_dir, 'final_model.pth')
         self._save_checkpoint(epoch, valid_metrics, final_path)
+
+        # Close TensorBoard writer
+        self.writer.close()
 
         print("\n" + "=" * 60)
         print("Training Complete!")
@@ -541,6 +555,56 @@ class Trainer:
             print(f"Loaded best model (best {metric})")
         else:
             print(f"Best model for {metric} not found")
+
+    def _log_epoch(
+        self,
+        epoch: int,
+        loss: float,
+        metrics: Dict[str, Any],
+        lr: float,
+        phase: str = 'train'
+    ):
+        """Log metrics to TensorBoard."""
+        prefix = phase.capitalize()
+
+        # Loss and LR
+        self.writer.add_scalar(f'{prefix}/Loss', loss, epoch)
+        self.writer.add_scalar(f'{prefix}/LR', lr, epoch)
+
+        # Accuracy
+        self.writer.add_scalar(f'{prefix}/Accuracy', metrics.get('acc', 0), epoch)
+
+        # AUPRC / AUROC (if available)
+        if metrics.get('macro_auprc', 0) > 0:
+            self.writer.add_scalar(f'{prefix}/AUPRC/macro', metrics['macro_auprc'], epoch)
+        if metrics.get('macro_auroc', 0) > 0:
+            self.writer.add_scalar(f'{prefix}/AUROC/macro', metrics['macro_auroc'], epoch)
+
+        # Macro metrics (if available)
+        if metrics.get('macro_f1', 0) > 0:
+            self.writer.add_scalar(f'{prefix}/Macro/f1', metrics['macro_f1'], epoch)
+        if metrics.get('macro_recall', 0) > 0:
+            self.writer.add_scalar(f'{prefix}/Macro/recall', metrics['macro_recall'], epoch)
+        if metrics.get('macro_precision', 0) > 0:
+            self.writer.add_scalar(f'{prefix}/Macro/precision', metrics['macro_precision'], epoch)
+
+        # Weighted metrics (if available)
+        if metrics.get('weighted_f1', 0) > 0:
+            self.writer.add_scalar(f'{prefix}/Weighted/f1', metrics['weighted_f1'], epoch)
+        if metrics.get('weighted_auprc', 0) > 0:
+            self.writer.add_scalar(f'{prefix}/AUPRC/weighted', metrics['weighted_auprc'], epoch)
+        if metrics.get('weighted_auroc', 0) > 0:
+            self.writer.add_scalar(f'{prefix}/AUROC/weighted', metrics['weighted_auroc'], epoch)
+
+        # Per-class metrics (if available)
+        if 'per_class_acc' in metrics:
+            for i, name in enumerate(self.class_names):
+                if i < len(metrics['per_class_acc']):
+                    self.writer.add_scalar(f'{prefix}/PerClass/{name}/accuracy', metrics['per_class_acc'][i], epoch)
+        if 'per_class_f1' in metrics:
+            for i, name in enumerate(self.class_names):
+                if i < len(metrics['per_class_f1']):
+                    self.writer.add_scalar(f'{prefix}/PerClass/{name}/f1', metrics['per_class_f1'][i], epoch)
 
     def _print_epoch_summary(
         self,

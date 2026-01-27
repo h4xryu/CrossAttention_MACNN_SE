@@ -16,7 +16,7 @@ from src.utils import ExcelResultWriter
 from utils import set_seed, load_or_extract_data
 
 # 실험 결과 디렉토리
-RESULTS_DIR = "/home/work/Ryuha/autoexp_results_202602/20260126_210649"
+RESULTS_DIR = "/home/work/Ryuha/autoexp_results_202602/20260127_102632"
 
 # 엑셀 저장 경로
 EXCEL_PATH = "/home/work/Ryuha/ECG_CrossAttention-stored/model_fusion_results_batch.xlsx"
