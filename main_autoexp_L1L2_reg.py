@@ -129,12 +129,12 @@ def run_single_experiment(base_config: dict, reg_params: dict, exp_name: str,
 
     # 결과 평가
     results = {'exp_name': exp_name, 'reg_params': reg_params, 'status': 'success', 'full_metrics': {}}
-    for metric in ["macro_auprc", "macro_auroc", "macro_f1"]:
+    for metric in ["macro_auprc", "macro_auroc"]:
         if trainer.load_best_model(metric):
             test_metrics = trainer.evaluate(test_loader)
             results[f"test_{metric}"] = test_metrics
             results['full_metrics'][metric] = test_metrics
-            
+
     return results
 
 def main():
@@ -221,7 +221,14 @@ def main():
                 metrics = res['full_metrics']['macro_auprc']
                 if excel_writer:
                     excel_writer.write_metrics(exp_name, metrics, "auprc")
+                    if 'confusion_matrix' in metrics:
+                        excel_writer.write_confusion_matrix(exp_name, metrics['confusion_matrix'], "auprc")
                 print(f" -> {exp_name}: Acc={metrics['acc']:.4f}, F1={metrics['macro_f1']:.4f}, AUPRC={metrics['macro_auprc']:.4f}")
+
+                # Confusion Matrix 출력
+                if 'confusion_matrix' in metrics:
+                    print(f"\n[{exp_name}] Confusion Matrix (Best AUPRC model):")
+                    print(metrics['confusion_matrix'])
                 
         except Exception as e:
             print(f"ERROR in {exp_name}: {e}")

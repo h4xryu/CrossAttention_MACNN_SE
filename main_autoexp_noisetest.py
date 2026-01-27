@@ -113,7 +113,7 @@ def run_single_experiment(exp_config: dict, exp_name: str, loader_key: str, data
             
     return results
 
-    
+
 def main():
     device = config.get_device()
     print(f"Device: {device}")
@@ -205,7 +205,14 @@ def main():
                 metrics = res['full_metrics']['macro_auprc']
                 if excel_writer:
                     excel_writer.write_metrics(exp_name, metrics, "auprc")
+                    if 'confusion_matrix' in metrics:
+                        excel_writer.write_confusion_matrix(exp_name, metrics['confusion_matrix'], "auprc")
                 print(f" -> {exp_name}: Acc={metrics['acc']:.4f}, F1={metrics['macro_f1']:.4f}, AUPRC={metrics['macro_auprc']:.4f}")
+
+                # Confusion Matrix 출력
+                if 'confusion_matrix' in metrics:
+                    print(f"\n[{exp_name}] Confusion Matrix (Best AUPRC model):")
+                    print(metrics['confusion_matrix'])
         except Exception as e:
             print(f"ERROR in {exp_name}: {e}")
             import traceback
