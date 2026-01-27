@@ -179,7 +179,16 @@ def main():
     # [실험 실행 섹션]
     print(f"\n[2/2] Running {len(EXPERIMENT_SCENARIOS)} Verification Scenarios...")
     
-    excel_writer = ExcelResultWriter("./model_fusion.xlsx", os.path.join(OUTPUT_DIR, "results.xlsx"), config.CLASSES)
+    # 엑셀 writer 초기화 (템플릿 파일 존재 확인)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    template_path = os.path.join(script_dir, "model_fusion.xlsx")
+    excel_writer = None
+    
+    if os.path.exists(template_path):
+        excel_path = os.path.join(OUTPUT_DIR, "results.xlsx")
+        excel_writer = ExcelResultWriter(template_path, excel_path, config.CLASSES)
+    else:
+        print(f"Warning: Template file not found at {template_path}. Excel results will not be saved.")
     
     for exp_name, exp_config, loader_key in EXPERIMENT_SCENARIOS:
         try:
@@ -188,7 +197,8 @@ def main():
             # 결과 기록 (Best AUPRC 기준)
             if 'test_macro_auprc' in res:
                 metrics = res['full_metrics']['macro_auprc']
-                excel_writer.write_metrics(exp_name, metrics, "auprc")
+                if excel_writer:
+                    excel_writer.write_metrics(exp_name, metrics, "auprc")
                 print(f" -> {exp_name}: Acc={metrics['acc']:.4f}, F1={metrics['macro_f1']:.4f}, AUPRC={metrics['macro_auprc']:.4f}")
         except Exception as e:
             print(f"ERROR in {exp_name}: {e}")

@@ -77,6 +77,11 @@ class DAEACDataset(Dataset):
         seq_len = data.shape[1]
         n_samples = len(data)
 
+        # RR features가 7개 컬럼인 경우 처음 2개만 선택 (캐시 호환성)
+        if rr_features.ndim == 2 and rr_features.shape[1] == 7:
+            print(f"  Warning: RR features has 7 columns, selecting first 2 columns for DAEAC format")
+            rr_features = rr_features[:, :2]
+
         # Validate rr_features shape
         self._validate_rr_features(rr_features, labels)
 
@@ -162,6 +167,11 @@ class Opt3Dataset(Dataset):
 
         seq_len = data.shape[1]
         n_samples = len(data)
+
+        # RR features_2d가 7개 컬럼인 경우 처음 2개만 선택 (캐시 호환성)
+        if rr_features_2d.ndim == 2 and rr_features_2d.shape[1] == 7:
+            print(f"  Warning: rr_features_2d has 7 columns, selecting first 2 columns for Opt3 format")
+            rr_features_2d = rr_features_2d[:, :2]
 
         # Validate shapes
         if rr_features_2d.shape[1] != 2:
