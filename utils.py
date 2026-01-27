@@ -82,58 +82,84 @@ def get_rr_feature_function(option: str):
 
     return functions[option]
 
-
 def compute_rr_features_opt1(ecg_signal: np.ndarray, r_peaks: np.ndarray, fs: int = 360) -> np.ndarray:
-    """기존 실험용 RR features (7 features)"""
+    """
+    [수정됨] 7-Dim Full Ratio Strategy
+    - 기존 7차원 설정을 유지하면서 '절대값(ms)' 노이즈를 제거
+    - 7개 슬롯을 모두 '상대적 비율(Ratio)'로 채워 Inter-patient 성능 최적화
+    
+    Features (7-Dim):
+        [0] Pre_RR / Local_RR     (핵심: 조기성 감지)
+        [1] Pre_RR / Post_RR      (핵심: 보상 휴지기 확인)
+        [2] Pre_RR / Prev_Pre_RR  (핵심: 급격한 변화 - t-1 시점)
+        [3] Post_RR / Local_RR    (핵심: 회복 후 리듬 확인)
+        [4] Local_RR / Global_RR  (보조: 환자 평소 대비 현재 상태)
+        [5] Pre_RR / Pre_RR(t-2)  (보조: 급격한 변화 - t-2 시점)
+        [6] Post_RR / Next_Post_RR(보조: 회복 안정성)
+    """
     n_beats = len(r_peaks)
     ms_factor = 1000.0 / fs
 
+    # 1. Raw RR Interval 계산 (내부 계산용, 절대값 ms)
     pre_rr = np.zeros(n_beats, dtype=np.float32)
     post_rr = np.zeros(n_beats, dtype=np.float32)
-    local_rr = np.zeros(n_beats, dtype=np.float32)
-
+    
+    # Pre/Post RR 계산
     for i in range(n_beats):
+        # Pre-RR
         if i > 0:
             pre_rr[i] = (r_peaks[i] - r_peaks[i-1]) * ms_factor
         else:
-            if n_beats > 1:
-                pre_rr[i] = (r_peaks[1] - r_peaks[0]) * ms_factor
-            else:
-                pre_rr[i] = 800.0
+            pre_rr[i] = 800.0 if n_beats <= 1 else (r_peaks[1] - r_peaks[0]) * ms_factor
 
+        # Post-RR
         if i < n_beats - 1:
             post_rr[i] = (r_peaks[i+1] - r_peaks[i]) * ms_factor
         else:
-            if n_beats > 1:
-                post_rr[i] = (r_peaks[-1] - r_peaks[-2]) * ms_factor
-            else:
-                post_rr[i] = 800.0
+            post_rr[i] = 800.0 if n_beats <= 1 else (r_peaks[-1] - r_peaks[-2]) * ms_factor
 
+    # Local RR (최근 10개 평균)
+    local_rr = np.zeros(n_beats, dtype=np.float32)
     for i in range(n_beats):
         start_idx = max(0, i - 9)
         window = pre_rr[start_idx:i+1]
-        if len(window) > 0:
-            local_rr[i] = np.mean(window)
-        else:
-            local_rr[i] = pre_rr[i]
+        local_rr[i] = np.mean(window) if len(window) > 0 else pre_rr[i]
 
+    # Global RR (전체 평균 - 50ms 이하 노이즈 제외)
     valid_pre_rr = pre_rr[pre_rr > 50]
-    if len(valid_pre_rr) > 1:
-        global_rr_mean = np.mean(valid_pre_rr)
-    else:
-        global_rr_mean = 800.0
+    global_rr_val = np.mean(valid_pre_rr) if len(valid_pre_rr) > 1 else 800.0
+    global_rr = np.full(n_beats, global_rr_val, dtype=np.float32)
 
-    global_rr = np.full(n_beats, global_rr_mean, dtype=np.float32)
+    # 2. Feature Calculation (All Ratios)
+    epsilon = 1e-8
+    
+    # [0] Pre / Local
+    feat0 = pre_rr / (local_rr + epsilon)
+    
+    # [1] Pre / Post
+    feat1 = pre_rr / (post_rr + epsilon)
+    
+    # [2] Pre / Prev (t-1)
+    feat2 = np.ones(n_beats, dtype=np.float32)
+    feat2[1:] = pre_rr[1:] / (pre_rr[:-1] + epsilon)
+    
+    # [3] Post / Local
+    feat3 = post_rr / (local_rr + epsilon)
+    
+    # [4] Local / Global (환자의 Base 대비 현재 속도)
+    # 절대값은 위험하지만, Local/Global 비율은 환자 특성을 정규화(Normalize)하므로 안전함
+    feat4 = local_rr / (global_rr + epsilon)
+    
+    # [5] Pre / Pre (t-2) (조금 더 넓은 범위의 급발진 체크)
+    feat5 = np.ones(n_beats, dtype=np.float32)
+    feat5[2:] = pre_rr[2:] / (pre_rr[:-2] + epsilon)
+    
+    # [6] Post / Next_Post (t+1) (회복 후 다음 박동과의 비율)
+    feat6 = np.ones(n_beats, dtype=np.float32)
+    feat6[:-1] = post_rr[:-1] / (post_rr[1:] + epsilon)
 
-    epsilon = 1.0
-    pre_div_post = pre_rr / np.maximum(post_rr, epsilon)
-    pre_minus_global = pre_rr - global_rr
-    pre_div_global = pre_rr / np.maximum(global_rr, epsilon)
-
-    all_features = np.stack([
-        pre_rr, post_rr, local_rr, pre_div_post,
-        global_rr, pre_minus_global, pre_div_global
-    ], axis=1).astype(np.float32)
+    # 3. Stack (N, 7)
+    all_features = np.stack([feat0, feat1, feat2, feat3, feat4, feat5, feat6], axis=1).astype(np.float32)
 
     return all_features
 

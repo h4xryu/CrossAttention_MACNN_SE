@@ -49,9 +49,9 @@ OUTPUT_DIR = "./verification_exp_202602/"
 # =============================================================================
 # 실행 로직 (기존 코드 재사용 및 단순화)
 # =============================================================================
-
 def run_single_experiment(exp_config: dict, exp_name: str, loader_key: str, data_loaders: dict, device):
-    """단일 실험 수행"""
+    """단일 실험 수행 (검증 실험용 - reg_params 없음)"""
+    
     # 데이터로더 선택
     loaders = data_loaders[loader_key]
     train_loader, valid_loader, test_loader = loaders
@@ -74,7 +74,7 @@ def run_single_experiment(exp_config: dict, exp_name: str, loader_key: str, data
     ModelClass = MODEL_REGISTRY.get(config.MODEL_NAME)
     model = ModelClass(**model_config)
 
-    # Loss, Optimizer, Scheduler 설정 (기존과 동일)
+    # Loss 설정
     class_weights = None
     if config.LOSS_CONFIG.get('use_class_weights', False):
         labels = train_loader.dataset.labels
@@ -87,6 +87,7 @@ def run_single_experiment(exp_config: dict, exp_name: str, loader_key: str, data
     LossClass = LOSS_REGISTRY.get(config.LOSS_NAME)
     criterion = LossClass(weight=class_weights)
     
+    # Optimizer & Scheduler (기본 설정 사용)
     optimizer = build_optimizer(model.parameters(), config.OPTIMIZER_NAME, **config.OPTIMIZER_CONFIG)
     scheduler = build_scheduler(optimizer, config.SCHEDULER_NAME, **config.SCHEDULER_CONFIG)
 
@@ -100,14 +101,19 @@ def run_single_experiment(exp_config: dict, exp_name: str, loader_key: str, data
 
     # 결과 평가
     results = {'exp_name': exp_name, 'config': exp_config, 'status': 'success', 'full_metrics': {}}
-    for metric in ["macro_auprc", "macro_auroc", "macro_f1"]: # F1도 중요 모니터링
-        if trainer.load_best_model(metric): # 모델 로드 성공 시에만
+    
+    # 저장된 모델 로드 (config.py에 macro_f1이 없다면 auprc, auroc만 로드)
+    target_metrics = ["macro_auprc", "macro_auroc"]
+    
+    for metric in target_metrics:
+        if trainer.load_best_model(metric):
             test_metrics = trainer.evaluate(test_loader)
             results[f"test_{metric}"] = test_metrics
             results['full_metrics'][metric] = test_metrics
             
     return results
 
+    
 def main():
     device = config.get_device()
     print(f"Device: {device}")

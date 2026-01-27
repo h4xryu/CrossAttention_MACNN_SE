@@ -546,15 +546,21 @@ class Trainer:
 
         print(f"Loaded checkpoint from epoch {self.current_epoch}")
 
-    def load_best_model(self, metric: str = 'macro_auprc'):
-        """Load best model for given metric."""
+    def load_best_model(self, metric: str = 'macro_auprc') -> bool:
+        """Load best model for given metric.
+
+        Returns:
+            True if model loaded successfully, False otherwise.
+        """
         path = os.path.join(self.best_model_dir, f'best_{metric}.pth')
         if os.path.exists(path):
             checkpoint = torch.load(path, map_location=self.device, weights_only=False)
             self.model.load_state_dict(checkpoint['model_state_dict'])
             print(f"Loaded best model (best {metric})")
+            return True
         else:
             print(f"Best model for {metric} not found")
+            return False
 
     def _log_epoch(
         self,
