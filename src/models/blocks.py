@@ -317,45 +317,16 @@ class ConcatFusion(nn.Module):
     def forward(self, x: torch.Tensor, rr_features: torch.Tensor) -> torch.Tensor:
         return torch.cat([self.mlp(x), rr_features], dim=1)
 
-
 class ConcatProjectionFusion(nn.Module):
     """
-    Concatenation with RR feature projection.
+    Concatenation with RR feature projection + Gating
 
-    Projects both ECG and RR features to same dimension before concatenation.
+    Output:
+        concat([alpha * RR_proj(rr), ECG_mlp(x)])
 
-    Args:
-        emb_dim: Embedding dimension
-        expansion: MLP expansion factor
-        rr_dim: RR feature dimension
-    """
-
-    def __init__(self, emb_dim: int = 64, expansion: int = 2, rr_dim: int = 7, **kwargs):
-        super().__init__()
-        self.rr_proj = nn.Sequential(
-            nn.Linear(rr_dim, emb_dim),
-            nn.LayerNorm(emb_dim),
-            nn.GELU()
-        )
-        self.mlp = nn.Sequential(
-            nn.Linear(emb_dim, expansion * emb_dim),
-            nn.LayerNorm(expansion * emb_dim),
-            nn.GELU(),
-            nn.Dropout(0.2),
-            nn.Linear(expansion * emb_dim, emb_dim),
-        )
-
-    def forward(self, x: torch.Tensor, rr_features: torch.Tensor) -> torch.Tensor:
-        return torch.cat([self.rr_proj(rr_features), self.mlp(x)], dim=1)
-
-
-
-class MultiHeadCrossAttentionFusion(nn.Module):
-    """
-    RR (Query) → ECG (Key, Value)
-    Cross-Attention + FFN (Transformer-style)
-
-    Output is aligned to 2 * emb_dim to be consistent with concat_proj fusion.
+    목적:
+        - RR feature가 classifier를 과도하게 흔들지 않도록 제어
+        - baseline accuracy 유지 + macro gain 확보
     """
 
     def __init__(
@@ -363,80 +334,173 @@ class MultiHeadCrossAttentionFusion(nn.Module):
         emb_dim: int = 128,
         expansion: int = 3,
         rr_dim: int = 7,
-        num_heads: int = 1,
+        dropout: float = 0.3,
         **kwargs
     ):
         super().__init__()
-        if emb_dim % num_heads != 0:
-            raise ValueError(f"emb_dim({emb_dim}) must be divisible by num_heads({num_heads}).")
 
-        self.emb_dim = emb_dim
-        self.rr_dim = rr_dim
-        self.num_heads = num_heads
-        self.out_dim = 2 * emb_dim 
-
-        # RR → Query projection
+        # RR projection
         self.rr_proj = nn.Sequential(
             nn.Linear(rr_dim, emb_dim),
             nn.LayerNorm(emb_dim),
             nn.GELU()
         )
 
-        # Cross-Attention
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim=emb_dim,
-            num_heads=num_heads,
-            dropout=0.2,
-            batch_first=True
-        )
-
-        # FFN (Position-wise)
-        self.ffn = nn.Sequential(
+        # ECG feature MLP
+        self.mlp = nn.Sequential(
             nn.Linear(emb_dim, expansion * emb_dim),
+            nn.LayerNorm(expansion * emb_dim),
             nn.GELU(),
-            nn.Dropout(0.2),
+            nn.Dropout(dropout),
             nn.Linear(expansion * emb_dim, emb_dim),
         )
 
+        #  Gate parameter alpha (learnable scalar)
+        self.alpha = nn.Parameter(torch.tensor(-2.0))
+        # sigmoid(-2) ≈ 0.12 → RR 영향 약하게 시작
+
+    def forward(self, x: torch.Tensor, rr_features: torch.Tensor) -> torch.Tensor:
+
+        rr_emb = self.rr_proj(rr_features)   # (B, emb_dim)
+        ecg_emb = self.mlp(x)                # (B, emb_dim)
+
+        #  Gate scaling
+        gate = torch.sigmoid(self.alpha)     # scalar ∈ (0,1)
+        rr_emb = gate * rr_emb
+
+        #  Concat fusion
+        fused = torch.cat([rr_emb, ecg_emb], dim=1)
+
+        return fused
+
+
+class MultiHeadCrossAttentionFusion(nn.Module):
+    """
+    RR(Query) → ECG(Key,Value)
+    Cross-Attention + FFN + Channel-wise Gated Concat Fusion
+
+    Output:
+        concat([x_pool, gate ⊙ attn_out]) → (B, 2*emb_dim)
+    """
+
+    def __init__(
+        self,
+        emb_dim: int = 128,
+        expansion: int = 2,
+        rr_dim: int = 7,
+        num_heads: int = 1,
+        dropout: float = 0.2,
+        **kwargs
+    ):
+        super().__init__()
+
+        if emb_dim % num_heads != 0:
+            raise ValueError(
+                f"emb_dim({emb_dim}) must be divisible by num_heads({num_heads})"
+            )
+
+        self.emb_dim = emb_dim
+        self.rr_dim = rr_dim
+        self.num_heads = num_heads
+
+        # Output dim은 concat이므로 2*emb_dim 유지
+        self.out_dim = 2 * emb_dim
+
+        # ------------------------------------------------------------
+        # RR → Query projection
+        # ------------------------------------------------------------
+        self.rr_proj = nn.Sequential(
+            nn.Linear(rr_dim, emb_dim),
+            nn.LayerNorm(emb_dim),
+            nn.GELU()
+        )
+
+        # ------------------------------------------------------------
+        # Cross Attention (RR query → ECG key/value)
+        # ------------------------------------------------------------
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=emb_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+
+        # ------------------------------------------------------------
+        # FFN (Transformer-style)
+        # ------------------------------------------------------------
+        self.ffn = nn.Sequential(
+            nn.Linear(emb_dim, expansion * emb_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(expansion * emb_dim, emb_dim),
+        )
+
+        # LayerNorms
         self.norm1 = nn.LayerNorm(emb_dim)
         self.norm2 = nn.LayerNorm(emb_dim)
+
+        # ------------------------------------------------------------
+        # ⭐ Channel-wise Gate parameter alpha
+        # ------------------------------------------------------------
+        # alpha ∈ R^{emb_dim}
+        # sigmoid(alpha_i) ∈ (0,1)
+        self.alpha = nn.Parameter(torch.ones(emb_dim) * -2.0)
+        # 초기 gate ≈ 0.12로 RR 영향 약하게 시작
 
     def forward(self, x: torch.Tensor, rr_features: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: (B, T, emb_dim) or (B, emb_dim)
+            x: (B, emb_dim) or (B, T, emb_dim)
             rr_features: (B, rr_dim)
+
         Returns:
-            (B, 2 * emb_dim)
+            fused: (B, 2*emb_dim)
         """
 
-        # Ensure ECG is sequence
+        # ------------------------------------------------------------
+        # ECG feature handling
+        # ------------------------------------------------------------
         if x.dim() == 2:
-            x_seq = x.unsqueeze(1)          # (B, 1, emb)
-            x_pool = x                      # (B, emb)
+            x_seq = x.unsqueeze(1)   # (B,1,emb)
+            x_pool = x              # (B,emb)
         elif x.dim() == 3:
-            x_seq = x                       # (B, T, emb)
-            x_pool = x.mean(dim=1)          # (B, emb)
+            x_seq = x               # (B,T,emb)
+            x_pool = x.mean(dim=1)  # (B,emb)
         else:
             raise ValueError(f"x must be 2D or 3D, got {tuple(x.shape)}")
 
+        # ------------------------------------------------------------
         # RR → Query
-        q = self.rr_proj(rr_features).unsqueeze(1)  # (B, 1, emb)
+        # ------------------------------------------------------------
+        q = self.rr_proj(rr_features).unsqueeze(1)  # (B,1,emb)
 
-        # Cross-Attention
+        # ------------------------------------------------------------
+        # Cross Attention
+        # ------------------------------------------------------------
         attn_out, _ = self.cross_attn(
             query=q,
             key=x_seq,
             value=x_seq
-        )  # (B, 1, emb)
+        )  # (B,1,emb)
 
-        attn_out = self.norm1(attn_out.squeeze(1))  # (B, emb)
+        attn_out = attn_out.squeeze(1)  # (B,emb)
 
-        # FFN + Residual
-        attn_out = self.norm2(attn_out + self.ffn(attn_out))  # (B, emb)
+        # Norm + FFN residual
+        attn_out = self.norm1(attn_out)
+        attn_out = self.norm2(attn_out + self.ffn(attn_out))
 
-        return torch.cat([attn_out, x_pool], dim=1)  # (B, 2*emb)
+        # ------------------------------------------------------------
+        # ⭐ Channel-wise Gate scaling
+        # ------------------------------------------------------------
+        gate = torch.sigmoid(self.alpha)  # (emb_dim,)
+        attn_out = attn_out * gate.unsqueeze(0)  # (B,emb)
 
+        # ------------------------------------------------------------
+        # ✅ Final Fusion (Concat 유지)
+        # ------------------------------------------------------------
+        fused = torch.cat([x_pool, attn_out], dim=1)  # (B,2emb)
+
+        return fused
 
 
 # Fusion block factory
