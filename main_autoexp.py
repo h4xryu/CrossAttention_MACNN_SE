@@ -35,8 +35,8 @@ from utils import set_seed, load_or_extract_data
 # 실험할 파라미터 그리드
 EXPERIMENT_GRID = {
     # Fusion type 실험 (opt1, lead=1일 때만 의미있음)
-    "fusion_type": ["mhca"],
-    # "fusion_type": [None],
+    # "fusion_type": ["mhca"],
+    "fusion_type": [None],
 
     # MHCA용 num_heads (fusion_type="mhca"일 때만 사용)
     "fusion_num_heads": [1],

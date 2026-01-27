@@ -156,7 +156,7 @@ OPTIMIZER_NAME = "adam"  # Registry: "adam", "adamw", "sgd"
 
 OPTIMIZER_CONFIG = {
     "lr": 0.005,
-    "weight_decay": 1e-4,
+    "weight_decay": 1e-3,
 
     # Adam/AdamW specific
     "betas": (0.9, 0.999),
