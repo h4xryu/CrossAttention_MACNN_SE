@@ -1,459 +1,787 @@
-"""
-Automated Experiment Script
-
-여러 설정을 자동으로 실험합니다.
-config.py의 설정을 동적으로 변경하면서 실험을 수행합니다.
-
-사용법:
-    python main_autoexp.py
-"""
+# main_autoexp_for_ResU.py - ResU 모델 자동 실험
+# opt1 (1D) / opt3 (2D) 지원
+# AUROC, AUPRC, Last 3가지 best model 저장 후 테스트
 
 import os
-import copy
+import sys
 import time
+import copy
+from collections import Counter
 from datetime import datetime
-from itertools import product
 
 import numpy as np
+import pandas as pd
 import torch
-from torch.utils.data import DataLoader
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import matplotlib.pyplot as plt
+from sklearn.manifold import TSNE
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    confusion_matrix, precision_recall_fscore_support,
+    roc_auc_score, average_precision_score
+)
 
-import config
-from src.registry import MODEL_REGISTRY, LOSS_REGISTRY, DATASET_REGISTRY
-from src import models, losses, datasets
-from src.optimizers import build_optimizer
-from src.schedulers import build_scheduler
-from src.trainer import Trainer
-from src.utils import ExcelResultWriter, CumulativeExcelWriter
-from utils import set_seed, load_or_extract_data
-
+# ResU 모델 import
+sys.path.append('./src/models')
+from ResU import get_resu_model
 
 # =============================================================================
-# 실험 설정 - 여기만 수정하면 됩니다
+# 설정
 # =============================================================================
 
-# 실험할 파라미터 그리드
-EXPERIMENT_GRID = {
-    # Fusion type 실험 (opt1, lead=1일 때만 의미있음)
-    "fusion_type": ["concat_proj", "concat", "mhca",None],
-    # "fusion_type": [None],
+DATA_PATH = './data/mit-bih-arrhythmia-database-1.0.0/'
+OUTPUT_PATH = './auto_results_ResU/'
+CACHE_DIR = './dataset_cache_ResU/'
 
-    # MHCA용 num_heads (fusion_type="mhca"일 때만 사용)
-    "fusion_num_heads": [1],
+BATCH_SIZE = 1024
+EPOCHS = 75
+LR = 0.0001
+WEIGHT_DECAY = 1e-2
+SEED = 1234
+CLASSES = ['N', 'S', 'V', 'F']
+
+# 모델 설정
+MODEL_CONFIG = {
+    'in_channels': 1,
+    'out_ch': 128,
+    'mid_ch': 32,
+    'num_heads': 1,
+    # opt1: 7차원 RR features (pre, post, local, global, ratios)
+    # opt3: 2차원 RR features (pre_rr_ratio, near_pre_rr_ratio) - 3채널 입력에 포함
+    'n_rr_opt1': 7,
+    'n_rr_opt3': 2,
+    'n_channels_opt3': 3,  # opt3: ECG + pre_rr_ratio + near_pre_rr_ratio
 }
 
-# Fusion 실험용 설정 (late fusion은 opt1 스타일 필요)
-FUSION_EXP_CONFIG = {
-    "lead": 1,           # ECG only (RR은 late fusion으로)
-    "rr_dim": 7,         # opt1: 7 features
-    "dataset_name": "ecg_standard",
-    "rr_feature_option": "opt1",
+# ECG Parameters
+OUT_LEN = 720
+
+# 데이터 분할
+DS1_TRAIN = [
+    '101', '106', '108', '109', '112', '115', '116', '118', '119',
+    '122', '201', '203', '209', '215', '223', '230'
+]
+DS1_VALID = ['114', '124', '205', '207', '220', '208']
+DS2_TEST = [
+    '100', '103', '105', '111', '113', '117', '121', '123', '200', '202',
+    '210', '212', '213', '214', '219', '221', '222', '228', '231', '232',
+    '233', '234'
+]
+
+# 실험 정의
+# (실험명, 모델타입, 입력모드)
+EXPERIMENTS = [
+    # opt1 (1D): baseline, naive_concat, cross_attention
+    ('ResU_opt1_baseline', 'baseline', 'opt1'),
+    ('ResU_opt1_naive', 'naive_concat', 'opt1'),
+    ('ResU_opt1_cross', 'cross_attention', 'opt1'),
+
+    # opt3 (2D): baseline, naive_concat, cross_attention
+    ('ResU_opt3_baseline', 'baseline', 'opt3'),
+    ('ResU_opt3_naive', 'naive_concat', 'opt3'),
+    ('ResU_opt3_cross', 'cross_attention', 'opt3'),
+]
+
+# =============================================================================
+# Seed 설정
+# =============================================================================
+def set_seed(seed: int):
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
+
+# =============================================================================
+# 데이터 로드 (wfdb 사용)
+# =============================================================================
+import wfdb
+from scipy.interpolate import interp1d
+from scipy.signal import firwin, filtfilt
+from tqdm import tqdm
+import hashlib
+import json
+
+LABEL_GROUP_MAP = {
+    'N': 'N', 'L': 'N', 'R': 'N', 'e': 'N', 'j': 'N',
+    'A': 'S', 'a': 'S', 'J': 'S', 'S': 'S',
+    'V': 'V', 'E': 'V',
+    'F': 'F',
 }
+LABEL_TO_ID = {'N': 0, 'S': 1, 'V': 2, 'F': 3}
 
 
-# 실험별 epochs (빠른 실험용)
-EXP_EPOCHS = 100
+def resample_to_len(ts: np.ndarray, out_len: int) -> np.ndarray:
+    if len(ts) == out_len:
+        return ts.astype(np.float32)
+    if len(ts) < 2:
+        return np.pad(ts.astype(np.float32), (0, max(0, out_len - len(ts))), mode='edge')[:out_len]
+    x_old = np.linspace(0.0, 1.0, num=len(ts))
+    x_new = np.linspace(0.0, 1.0, num=out_len)
+    return interp1d(x_old, ts, kind='linear')(x_new).astype(np.float32)
 
-# 결과 저장 경로
-OUTPUT_DIR = "./autoexp_results_202602/"
+
+def remove_baseline_bandpass(signal: np.ndarray, fs: int = 360,
+                              lowcut: float = 0.1, highcut: float = 100.0,
+                              order: int = 256) -> np.ndarray:
+    nyquist = fs / 2.0
+    low = lowcut / nyquist
+    high = highcut / nyquist
+    fir_coeff = firwin(order + 1, [low, high], pass_zero=False)
+    return filtfilt(fir_coeff, 1.0, signal)
 
 
-# =============================================================================
-# 실험 실행 함수
-# =============================================================================
+def compute_rr_features(ann_samples, center_idx, fs=360):
+    """7차원 RR features 계산"""
+    rr_intervals = np.diff(ann_samples) / fs * 1000  # ms 단위
 
-def run_single_experiment(exp_config: dict, exp_name: str, data_loaders: dict, device):
-    """
-    단일 실험 수행
+    if len(rr_intervals) < 2:
+        return np.zeros(7, dtype=np.float32)
 
-    Args:
-        exp_config: 실험 설정 dict (MODEL_CONFIG에 병합됨)
-        exp_name: 실험 이름
-        data_loaders: {"opt1": loaders, "opt2": loaders, "opt3": loaders} 형태
-        device: torch device
+    # 현재 beat 기준 전후 RR intervals
+    beat_idx = center_idx
 
-    Returns:
-        결과 dict
-    """
-    load_start = time.time()
-    
-    # 데이터로더 선택
-    fusion_type = exp_config.get('fusion_type')
-    is_opt3 = exp_config.get('use_opt3', False)
-    
-    if is_opt3:
-        loaders = data_loaders["opt3"]
-    elif fusion_type is not None and fusion_type.lower() != 'none':
-        loaders = data_loaders["opt1"]
+    # 전 RR (pre-RR)
+    if beat_idx > 0:
+        pre_rr = rr_intervals[beat_idx - 1]
     else:
-        loaders = data_loaders["opt2"]
-    
-    load_time = time.time() - load_start
-    if load_time > 0.1:
-        print(f"  [Load time: {load_time:.2f}s]")
+        pre_rr = np.mean(rr_intervals)
 
-    train_loader, valid_loader, test_loader = loaders
+    # 후 RR (post-RR)
+    if beat_idx < len(rr_intervals):
+        post_rr = rr_intervals[beat_idx]
+    else:
+        post_rr = np.mean(rr_intervals)
 
-    print(f"\n{'='*60}")
-    print(f"Experiment: {exp_name}")
-    print(f"Config: {exp_config}")
-    print(f"{'='*60}")
+    # Local RR (±5 beats 평균)
+    local_start = max(0, beat_idx - 5)
+    local_end = min(len(rr_intervals), beat_idx + 5)
+    local_rr = np.mean(rr_intervals[local_start:local_end]) if local_end > local_start else pre_rr
 
-    set_seed(config.SEED)
+    # Global RR (전체 평균)
+    global_rr = np.mean(rr_intervals)
 
-    # 실험 디렉토리
-    exp_dir = os.path.join(OUTPUT_DIR, exp_name)
-    os.makedirs(exp_dir, exist_ok=True)
+    # RR ratios
+    pre_ratio = pre_rr / (local_rr + 1e-8)
+    post_ratio = post_rr / (local_rr + 1e-8)
+    local_global_ratio = local_rr / (global_rr + 1e-8)
 
-    # 모델 설정 병합
-    model_config = copy.deepcopy(config.MODEL_CONFIG)
+    return np.array([pre_rr, post_rr, local_rr, global_rr,
+                     pre_ratio, post_ratio, local_global_ratio], dtype=np.float32)
 
-    # opt3는 lead=3 (early fusion) + fusion_type (late fusion) + rr_dim=7
-    if is_opt3:
-        # opt3는 이미 exp_config에 설정되어 있음
-        pass
-    # Fusion 실험이면 opt1 설정 적용 (lead=1, rr_dim=7)
-    elif fusion_type is not None and fusion_type.lower() != 'none':
-        model_config.update({
-            "lead": FUSION_EXP_CONFIG["lead"],
-            "rr_dim": FUSION_EXP_CONFIG["rr_dim"],
-        })
 
-    model_config.update(exp_config)
+def compute_rr_features_2d(ann_samples, center_idx, fs=360):
+    """
+    opt3용 2차원 RR features 계산 (DAEACDataset 스타일)
+    Returns: [pre_rr_ratio, near_pre_rr_ratio]
+    """
+    rr_intervals = np.diff(ann_samples) / fs * 1000  # ms 단위
 
-    # 모델 생성
-    ModelClass = MODEL_REGISTRY.get(config.MODEL_NAME)
-    model = ModelClass(**model_config)
+    if len(rr_intervals) < 2:
+        return np.array([1.0, 1.0], dtype=np.float32)
 
-    total_params, _ = model.count_parameters()
-    print(f"Model parameters: {total_params:,}")
+    beat_idx = center_idx
 
-    # Loss
-    class_weights = None
-    if config.LOSS_CONFIG.get('use_class_weights', False):
-        labels = train_loader.dataset.labels
-        if torch.is_tensor(labels):
-            labels = labels.cpu().numpy()
-        counts = np.bincount(labels.flatten().astype(np.int64), minlength=config.NUM_CLASSES)
-        weights = 1.0 / (counts + 1e-8)
-        weights = weights / weights.sum() * config.NUM_CLASSES
-        class_weights = torch.tensor(weights, dtype=torch.float32).to(device)
+    # pre-RR interval
+    if beat_idx > 0:
+        pre_rr = rr_intervals[beat_idx - 1]
+    else:
+        pre_rr = np.mean(rr_intervals)
 
-    LossClass = LOSS_REGISTRY.get(config.LOSS_NAME)
-    criterion = LossClass(weight=class_weights)
+    # near pre-RR (post-RR of previous beat = pre-RR of current beat's neighbor)
+    if beat_idx > 1:
+        near_pre_rr = rr_intervals[beat_idx - 2]
+    elif beat_idx > 0:
+        near_pre_rr = rr_intervals[beat_idx - 1]
+    else:
+        near_pre_rr = np.mean(rr_intervals)
 
-    # Optimizer & Scheduler
-    optimizer = build_optimizer(model.parameters(), config.OPTIMIZER_NAME, **config.OPTIMIZER_CONFIG)
-    scheduler = build_scheduler(optimizer, config.SCHEDULER_NAME, **config.SCHEDULER_CONFIG)
+    # Local RR average (±5 beats)
+    local_start = max(0, beat_idx - 5)
+    local_end = min(len(rr_intervals), beat_idx + 5)
+    local_rr = np.mean(rr_intervals[local_start:local_end]) if local_end > local_start else pre_rr
 
-    # Trainer
-    trainer = Trainer(
-        model=model,
-        train_loader=train_loader,
-        valid_loader=valid_loader,
-        criterion=criterion,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        device=device,
-        exp_dir=exp_dir,
-        class_names=config.CLASSES,
+    # Ratios
+    pre_rr_ratio = pre_rr / (local_rr + 1e-8)
+    near_pre_rr_ratio = near_pre_rr / (local_rr + 1e-8)
+
+    return np.array([pre_rr_ratio, near_pre_rr_ratio], dtype=np.float32)
+
+
+def extract_data_opt1(record_list, base_path, out_len, split_name):
+    """
+    opt1: 1D single channel ECG + 7-dim RR features
+    Returns: (ecg_data, labels, rr_features, patient_ids, sample_ids)
+    """
+    patient_to_id = {rec: idx for idx, rec in enumerate(sorted(record_list))}
+
+    all_ecg = []
+    all_labels = []
+    all_rr = []
+    all_pids = []
+    all_sids = []
+
+    for rec in tqdm(record_list, desc=f"Extracting {split_name} (opt1)"):
+        try:
+            ann = wfdb.rdann(os.path.join(base_path, rec), 'atr')
+            sig, meta = wfdb.rdsamp(os.path.join(base_path, rec))
+        except Exception as e:
+            print(f"Warning: {rec} failed - {e}")
+            continue
+
+        patient_id = patient_to_id[rec]
+        fs = int(meta['fs'])
+        sig_names = meta['sig_name']
+
+        # MLII 선택
+        if 'MLII' in sig_names:
+            ch_idx = sig_names.index('MLII')
+        else:
+            ch_idx = 0
+
+        ecg_raw = sig[:, ch_idx].astype(np.float32)
+        ecg_filtered = remove_baseline_bandpass(ecg_raw, fs=fs)
+
+        pre = int(round(360 * fs / 360.0))
+        post = int(round(360 * fs / 360.0))
+
+        for idx, (center, symbol) in enumerate(zip(ann.sample, ann.symbol)):
+            grp = LABEL_GROUP_MAP.get(symbol, None)
+            if grp is None or grp not in CLASSES:
+                continue
+
+            start = center - pre
+            end = center + post
+
+            if start < 0 or end > len(ecg_filtered):
+                continue
+
+            seg = ecg_filtered[start:end]
+            seg = (seg - seg.mean()) / (seg.std() + 1e-8)
+            seg_resampled = resample_to_len(seg, out_len)
+
+            rr_feat = compute_rr_features(ann.sample, idx, fs)
+
+            all_ecg.append(seg_resampled[np.newaxis, :])  # (1, L)
+            all_labels.append(LABEL_TO_ID[grp])
+            all_rr.append(rr_feat)
+            all_pids.append(patient_id)
+            all_sids.append(idx)
+
+    print(f"{split_name} (opt1): {len(all_ecg)} samples")
+
+    return (
+        np.array(all_ecg, dtype=np.float32),
+        np.array(all_labels, dtype=np.int64),
+        np.array(all_rr, dtype=np.float32),
+        np.array(all_pids, dtype=np.int64),
+        np.array(all_sids, dtype=np.int64)
     )
 
-    # 학습
-    trainer.fit(epochs=EXP_EPOCHS)
 
-    # 테스트
-    results = {
-        'exp_name': exp_name,
-        'config': exp_config,
-        'status': 'success',
-        'full_metrics': {},  # 엑셀 저장용 전체 metrics
-    }
+def extract_data_opt3(record_list, base_path, out_len, split_name):
+    """
+    opt3: DAEAC 스타일 3채널 입력 (ECG + pre_rr_ratio + near_pre_rr_ratio)
+    Returns: (ecg_data, labels, rr_features, patient_ids, sample_ids)
 
-    for metric in ["macro_auprc", "macro_auroc", "macro_recall", "macro_f1"]:
-        trainer.load_best_model(metric)
-        test_metrics = trainer.evaluate(test_loader)
-        results[f"test_{metric}"] = {
-            'acc': test_metrics['acc'],
-            'macro_f1': test_metrics['macro_f1'],
-            'macro_auprc': test_metrics['macro_auprc'],
-            'macro_auroc': test_metrics['macro_auroc'],
-        }
-        results['full_metrics'][metric] = test_metrics  # 전체 metrics 저장
+    ecg_data shape: (N, L) - ECG 시그널만 (Dataset에서 3채널로 조합)
+    rr_features shape: (N, 2) - [pre_rr_ratio, near_pre_rr_ratio]
+    """
+    patient_to_id = {rec: idx for idx, rec in enumerate(sorted(record_list))}
 
-    return results
+    all_ecg = []
+    all_labels = []
+    all_rr = []
+    all_pids = []
+    all_sids = []
 
+    for rec in tqdm(record_list, desc=f"Extracting {split_name} (opt3)"):
+        try:
+            ann = wfdb.rdann(os.path.join(base_path, rec), 'atr')
+            sig, meta = wfdb.rdsamp(os.path.join(base_path, rec))
+        except Exception as e:
+            print(f"Warning: {rec} failed - {e}")
+            continue
 
-def generate_experiments():
-    """실험 설정 조합 생성"""
-    experiments = []
+        patient_id = patient_to_id[rec]
+        fs = int(meta['fs'])
+        sig_names = meta['sig_name']
 
-    for fusion_type in EXPERIMENT_GRID["fusion_type"]:
-        if fusion_type is None:
-            # Baseline: opt2 (DAEAC style, early fusion)
-            exp_config = {
-                "fusion_type": None,
-                "lead": 3,      # opt2: ECG + 2 RR channels
-                "rr_dim": 2,    # opt2: 2 RR features
-            }
-            exp_name = "baseline_opt2"
-            experiments.append((exp_config, exp_name))
-        elif fusion_type == "mhca":
-            # MHCA는 num_heads별로 실험
-            # opt1 style (late fusion only)
-            for num_heads in EXPERIMENT_GRID["fusion_num_heads"]:
-                exp_config = {
-                    "fusion_type": fusion_type,
-                    "fusion_num_heads": num_heads,
-                }
-                exp_name = f"mhca_h{num_heads}"
-                experiments.append((exp_config, exp_name))
-            
-            # opt3 style (early + late fusion)
-            for num_heads in EXPERIMENT_GRID["fusion_num_heads"]:
-                exp_config = {
-                    "fusion_type": fusion_type,
-                    "fusion_num_heads": num_heads,
-                    "lead": 3,      # opt3: ECG + 2 RR channels (early fusion)
-                    "rr_dim": 7,    # opt3: 7 RR features (late fusion)
-                    "use_opt3": True,
-                }
-                exp_name = f"opt3_mhca_h{num_heads}"
-                experiments.append((exp_config, exp_name))
+        # MLII 채널 선택 (단일 채널)
+        if 'MLII' in sig_names:
+            ch_idx = sig_names.index('MLII')
         else:
-            # concat, concat_proj: opt1 style (late fusion only)
-            exp_config = {"fusion_type": fusion_type}
-            exp_name = f"fusion_{fusion_type}"
-            experiments.append((exp_config, exp_name))
-            
-            # opt3 style (early + late fusion)
-            exp_config = {
-                "fusion_type": fusion_type,
-                "lead": 3,      # opt3: ECG + 2 RR channels (early fusion)
-                "rr_dim": 7,    # opt3: 7 RR features (late fusion)
-                "use_opt3": True,
-            }
-            exp_name = f"opt3_{fusion_type}"
-            experiments.append((exp_config, exp_name))
+            ch_idx = 0
 
-    return experiments
+        ecg_raw = sig[:, ch_idx].astype(np.float32)
+        ecg_filtered = remove_baseline_bandpass(ecg_raw, fs=fs)
+
+        pre = int(round(360 * fs / 360.0))
+        post = int(round(360 * fs / 360.0))
+
+        for idx, (center, symbol) in enumerate(zip(ann.sample, ann.symbol)):
+            grp = LABEL_GROUP_MAP.get(symbol, None)
+            if grp is None or grp not in CLASSES:
+                continue
+
+            start = center - pre
+            end = center + post
+
+            if start < 0 or end > len(ecg_filtered):
+                continue
+
+            seg = ecg_filtered[start:end]
+            seg = (seg - seg.mean()) / (seg.std() + 1e-8)
+            seg_resampled = resample_to_len(seg, out_len)
+
+            # 2차원 RR features (DAEAC 스타일)
+            rr_feat = compute_rr_features_2d(ann.sample, idx, fs)
+
+            all_ecg.append(seg_resampled)  # (L,) - Dataset에서 3채널로 조합
+            all_labels.append(LABEL_TO_ID[grp])
+            all_rr.append(rr_feat)  # (2,)
+            all_pids.append(patient_id)
+            all_sids.append(idx)
+
+    print(f"{split_name} (opt3): {len(all_ecg)} samples")
+
+    return (
+        np.array(all_ecg, dtype=np.float32),  # (N, L)
+        np.array(all_labels, dtype=np.int64),
+        np.array(all_rr, dtype=np.float32),   # (N, 2)
+        np.array(all_pids, dtype=np.int64),
+        np.array(all_sids, dtype=np.int64)
+    )
 
 
-def main():
-    """메인 자동 실험 실행"""
-    device = config.get_device()
+# =============================================================================
+# Dataset
+# =============================================================================
+class ECGDataset_opt1(Dataset):
+    """
+    opt1용 Dataset: 1D ECG (1, L) + 7-dim RR features
+    """
+    def __init__(self, ecg_data, labels, rr_features, patient_ids, sample_ids):
+        # ecg_data: (N, 1, L)
+        self.ecg_data = torch.FloatTensor(ecg_data)
+        self.labels = torch.LongTensor(labels)
+        self.rr_features = torch.FloatTensor(rr_features)  # (N, 7)
+        self.patient_ids = torch.LongTensor(patient_ids)
+        self.sample_ids = sample_ids
 
-    print(f"\n{'='*60}")
-    print("AUTOMATED EXPERIMENT")
-    print(f"{'='*60}")
-    print(f"Device: {device}")
+    def __len__(self):
+        return len(self.labels)
 
-    # 타임스탬프 디렉토리
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    global OUTPUT_DIR
-    OUTPUT_DIR = os.path.join(OUTPUT_DIR, timestamp)
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-    # 데이터 로드 (opt1, opt2 모두 로드)
-    print("\n[1/3] Loading Data...")
-
-    def load_split(records, split_name, extraction_style):
-        return load_or_extract_data(
-            record_list=records,
-            base_path=config.DATA_PATH,
-            valid_leads=config.VALID_LEADS,
-            out_len=config.SIGNAL_LENGTH,
-            split_name=split_name,
-            extraction_style=extraction_style
+    def __getitem__(self, idx):
+        return (
+            self.ecg_data[idx],       # (1, L)
+            self.rr_features[idx],    # (7,)
+            self.labels[idx],
+            self.patient_ids[idx],
+            idx
         )
 
-    data_loaders = {}
 
-    # opt2 (DAEAC style) - baseline용
-    print("  Loading opt2 (DAEAC) data...")
-    train_data_opt2 = load_split(config.DS1_TRAIN, "Train", "daeac")
-    valid_data_opt2 = load_split(config.DS1_VALID, "Valid", "daeac")
-    test_data_opt2 = load_split(config.DS2_TEST, "Test", "daeac")
+class ECGDataset_opt3(Dataset):
+    """
+    opt3용 Dataset: DAEAC 스타일 3채널 입력
+    ECG + pre_rr_ratio + near_pre_rr_ratio → (1, 3, L)
+    """
+    def __init__(self, ecg_data, labels, rr_features, patient_ids, sample_ids):
+        # ecg_data: (N, L) - ECG 시그널
+        # rr_features: (N, 2) - [pre_rr_ratio, near_pre_rr_ratio]
+        self.ecg_data = ecg_data  # numpy array (N, L)
+        self.labels = torch.LongTensor(labels)
+        self.rr_features = rr_features  # numpy array (N, 2)
+        self.patient_ids = torch.LongTensor(patient_ids)
+        self.sample_ids = sample_ids
+        self.seq_len = ecg_data.shape[1]
 
-    DatasetClass_opt2 = DATASET_REGISTRY.get("daeac")
-    train_ds_opt2 = DatasetClass_opt2(*train_data_opt2)
-    valid_ds_opt2 = DatasetClass_opt2(*valid_data_opt2)
-    test_ds_opt2 = DatasetClass_opt2(*test_data_opt2)
+    def __len__(self):
+        return len(self.labels)
 
-    data_loaders["opt2"] = (
-        DataLoader(train_ds_opt2, batch_size=config.BATCH_SIZE, shuffle=True, num_workers=config.NUM_WORKERS, pin_memory=True),
-        DataLoader(valid_ds_opt2, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=config.NUM_WORKERS, pin_memory=True),
-        DataLoader(test_ds_opt2, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=config.NUM_WORKERS, pin_memory=True),
-    )
+    def __getitem__(self, idx):
+        ecg = self.ecg_data[idx]  # (L,)
+        rr = self.rr_features[idx]  # (2,)
 
-    # opt1 (Standard) - fusion 실험용
-    print("  Loading opt1 (Standard) data...")
-    train_data_opt1 = load_split(config.DS1_TRAIN, "Train", "default")
-    valid_data_opt1 = load_split(config.DS1_VALID, "Valid", "default")
-    test_data_opt1 = load_split(config.DS2_TEST, "Test", "default")
+        # RR features를 ECG 길이로 확장
+        pre_rr_ratio = np.full(self.seq_len, rr[0], dtype=np.float32)
+        near_pre_rr_ratio = np.full(self.seq_len, rr[1], dtype=np.float32)
 
-    DatasetClass_opt1 = DATASET_REGISTRY.get("ecg_standard")
-    train_ds_opt1 = DatasetClass_opt1(*train_data_opt1)
-    valid_ds_opt1 = DatasetClass_opt1(*valid_data_opt1)
-    test_ds_opt1 = DatasetClass_opt1(*test_data_opt1)
+        # 3채널로 스택: (3, L) → (1, 3, L)
+        x = np.stack([ecg, pre_rr_ratio, near_pre_rr_ratio], axis=0)
+        x = x[np.newaxis, :, :]  # (1, 3, L)
 
-    data_loaders["opt1"] = (
-        DataLoader(train_ds_opt1, batch_size=config.BATCH_SIZE, shuffle=True, num_workers=config.NUM_WORKERS, pin_memory=True),
-        DataLoader(valid_ds_opt1, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=config.NUM_WORKERS, pin_memory=True),
-        DataLoader(test_ds_opt1, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=config.NUM_WORKERS, pin_memory=True),
-    )
+        return (
+            torch.from_numpy(x).float(),  # (1, 3, L)
+            torch.from_numpy(rr).float(),  # (2,) - 별도 RR features (cross-attention용)
+            self.labels[idx],
+            self.patient_ids[idx],
+            idx
+        )
 
-    # opt3 (Early fusion + Late fusion) - opt2 데이터 + opt1의 7차원 RR features
-    print("  Loading opt3 (Early+Late fusion) data...")
-    opt3_start = time.time()
-    
-    def match_rr_features_7d(opt2_data, opt1_data):
-        """opt2 샘플에 대해 opt1에서 같은 patient_id, sample_id를 가진 7차원 RR features를 찾아 매칭"""
-        opt2_pids = opt2_data[3]  # patient_ids
-        opt2_sids = opt2_data[4]  # sample_ids
-        opt1_pids = opt1_data[3]
-        opt1_sids = opt1_data[4]
-        opt1_rr_7d = opt1_data[2]  # 7차원 RR features
-        
-        # opt1에서 (patient_id, sample_id) -> index 매핑 생성
-        opt1_key_to_idx = {}
-        for idx, (pid, sid) in enumerate(zip(opt1_pids, opt1_sids)):
-            key = (int(pid), int(sid) if isinstance(sid, (int, np.integer)) else sid)
-            opt1_key_to_idx[key] = idx
-        
-        # opt2의 각 샘플에 대해 opt1에서 매칭된 7차원 RR features 찾기
-        matched_rr_7d = []
-        matched_indices = []
-        
-        for idx, (pid, sid) in enumerate(zip(opt2_pids, opt2_sids)):
-            key = (int(pid), int(sid) if isinstance(sid, (int, np.integer)) else sid)
-            if key in opt1_key_to_idx:
-                opt1_idx = opt1_key_to_idx[key]
-                matched_rr_7d.append(opt1_rr_7d[opt1_idx])
-                matched_indices.append(idx)
+
+# =============================================================================
+# 학습/평가 함수
+# =============================================================================
+def train_one_epoch(model, loader, optimizer, device):
+    model.train()
+    total_loss = 0
+    correct = 0
+    total = 0
+
+    criterion = nn.CrossEntropyLoss()
+
+    for batch in loader:
+        ecg, rr, labels, _, _ = batch
+        ecg = ecg.to(device)
+        rr = rr.to(device)
+        labels = labels.to(device)
+
+        optimizer.zero_grad()
+        logits, _ = model(ecg, rr)
+        loss = criterion(logits, labels)
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item() * ecg.size(0)
+        preds = logits.argmax(dim=1)
+        correct += (preds == labels).sum().item()
+        total += labels.size(0)
+
+    return {'loss': total_loss / total, 'acc': correct / total}
+
+
+def validate(model, loader, device):
+    model.eval()
+    total_loss = 0
+    correct = 0
+    total = 0
+
+    all_preds = []
+    all_labels = []
+    all_probs = []
+
+    criterion = nn.CrossEntropyLoss()
+
+    with torch.no_grad():
+        for batch in loader:
+            ecg, rr, labels, _, _ = batch
+            ecg = ecg.to(device)
+            rr = rr.to(device)
+            labels = labels.to(device)
+
+            logits, _ = model(ecg, rr)
+            loss = criterion(logits, labels)
+
+            total_loss += loss.item() * ecg.size(0)
+            probs = F.softmax(logits, dim=1)
+            preds = logits.argmax(dim=1)
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
+
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+            all_probs.extend(probs.cpu().numpy())
+
+    # AUROC/AUPRC 계산
+    y_true = np.array(all_labels)
+    y_probs = np.array(all_probs)
+    n_classes = len(CLASSES)
+    y_true_onehot = np.eye(n_classes)[y_true]
+
+    try:
+        per_class_auroc = []
+        per_class_auprc = []
+        for c in range(n_classes):
+            if y_true_onehot[:, c].sum() > 0:
+                auroc = roc_auc_score(y_true_onehot[:, c], y_probs[:, c])
+                auprc = average_precision_score(y_true_onehot[:, c], y_probs[:, c])
             else:
-                # 매칭 실패 - 이 샘플은 제외
-                pass
-        
-        # 매칭된 샘플만 필터링
-        matched_data = opt2_data[0][matched_indices]
-        matched_labels = opt2_data[1][matched_indices]
-        matched_rr_2d = opt2_data[2][matched_indices]
-        matched_pids = opt2_data[3][matched_indices]
-        matched_sids = opt2_data[4][matched_indices]
-        
-        matched_rr_7d = np.array(matched_rr_7d)
-        
-        print(f"    Matched {len(matched_indices)}/{len(opt2_data[0])} samples")
-        
-        return (matched_data, matched_labels, matched_rr_2d, matched_rr_7d, matched_pids, matched_sids)
-    
-    # Train 데이터 매칭
-    train_opt3 = match_rr_features_7d(train_data_opt2, train_data_opt1)
-    valid_opt3 = match_rr_features_7d(valid_data_opt2, valid_data_opt1)
-    test_opt3 = match_rr_features_7d(test_data_opt2, test_data_opt1)
-    
-    DatasetClass_opt3 = DATASET_REGISTRY.get("opt3")
-    train_ds_opt3 = DatasetClass_opt3(*train_opt3)
-    valid_ds_opt3 = DatasetClass_opt3(*valid_opt3)
-    test_ds_opt3 = DatasetClass_opt3(*test_opt3)
-    
-    data_loaders["opt3"] = (
-        DataLoader(train_ds_opt3, batch_size=config.BATCH_SIZE, shuffle=True, num_workers=config.NUM_WORKERS, pin_memory=True),
-        DataLoader(valid_ds_opt3, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=config.NUM_WORKERS, pin_memory=True),
-        DataLoader(test_ds_opt3, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=config.NUM_WORKERS, pin_memory=True),
+                auroc = 0.0
+                auprc = 0.0
+            per_class_auroc.append(auroc)
+            per_class_auprc.append(auprc)
+
+        macro_auroc = np.mean(per_class_auroc)
+        macro_auprc = np.mean(per_class_auprc)
+    except:
+        macro_auroc = 0.0
+        macro_auprc = 0.0
+        per_class_auroc = [0.0] * n_classes
+        per_class_auprc = [0.0] * n_classes
+
+    metrics = {
+        'loss': total_loss / total,
+        'acc': correct / total,
+        'macro_auroc': macro_auroc,
+        'macro_auprc': macro_auprc,
+        'per_class_auroc': per_class_auroc,
+        'per_class_auprc': per_class_auprc,
+    }
+
+    return metrics, np.array(all_preds), np.array(all_labels), np.array(all_probs)
+
+
+def calculate_test_metrics(y_true, y_pred, y_probs, classes):
+    """테스트용 상세 메트릭 계산"""
+    n_classes = len(classes)
+
+    cm = confusion_matrix(y_true, y_pred, labels=range(n_classes))
+    precision, recall, f1, support = precision_recall_fscore_support(
+        y_true, y_pred, labels=range(n_classes), zero_division=0
     )
-    
-    opt3_time = time.time() - opt3_start
-    print(f"  [opt3 dataset creation: {opt3_time:.2f}s]")
 
-    print(f"  Train: {len(train_ds_opt2)} samples (opt2), {len(train_ds_opt1)} samples (opt1), {len(train_ds_opt3)} samples (opt3)")
-    print(f"  Valid: {len(valid_ds_opt2)} samples (opt2), {len(valid_ds_opt1)} samples (opt1), {len(valid_ds_opt3)} samples (opt3)")
-    print(f"  Test:  {len(test_ds_opt2)} samples (opt2), {len(test_ds_opt1)} samples (opt1), {len(test_ds_opt3)} samples (opt3)")
+    y_true_onehot = np.eye(n_classes)[y_true]
 
-    # 실험 목록 생성
-    experiments = generate_experiments()
-    print(f"\n[2/3] Running {len(experiments)} experiments...")
+    try:
+        per_class_auroc = []
+        per_class_auprc = []
+        for c in range(n_classes):
+            if y_true_onehot[:, c].sum() > 0:
+                auroc = roc_auc_score(y_true_onehot[:, c], y_probs[:, c])
+                auprc = average_precision_score(y_true_onehot[:, c], y_probs[:, c])
+            else:
+                auroc = 0.0
+                auprc = 0.0
+            per_class_auroc.append(auroc)
+            per_class_auprc.append(auprc)
 
-    # 엑셀 writer 초기화 (실험 시작 전에 미리 복사)
-    template_path = "./model_fusion.xlsx"
-    excel_writer = None
-    cumulative_writer = None
+        macro_auroc = np.mean(per_class_auroc)
+        macro_auprc = np.mean(per_class_auprc)
+    except:
+        per_class_auroc = [0.0] * n_classes
+        per_class_auprc = [0.0] * n_classes
+        macro_auroc = 0.0
+        macro_auprc = 0.0
 
-    if os.path.exists(template_path):
-        excel_path = os.path.join(OUTPUT_DIR, "autoexp_results.xlsx")
-        excel_writer = ExcelResultWriter(template_path, excel_path, classes=config.CLASSES)
+    return {
+        'confusion_matrix': cm,
+        'per_class_precision': precision,
+        'per_class_recall': recall,
+        'per_class_f1': f1,
+        'per_class_auroc': np.array(per_class_auroc),
+        'per_class_auprc': np.array(per_class_auprc),
+        'macro_precision': np.mean(precision),
+        'macro_recall': np.mean(recall),
+        'macro_f1': np.mean(f1),
+        'macro_auroc': macro_auroc,
+        'macro_auprc': macro_auprc,
+        'accuracy': (y_true == y_pred).mean(),
+        'support': support,
+    }
 
-        cumulative_path = "./cumulative_results.xlsx"
-        cumulative_writer = CumulativeExcelWriter(template_path, cumulative_path, classes=config.CLASSES)
-        print(f"[CumulativeExcel] Current record count: {cumulative_writer.get_record_count()}")
+
+# =============================================================================
+# 실험 실행
+# =============================================================================
+def run_experiment(exp_name, model_type, input_mode, data_dict, device):
+    """단일 실험 수행"""
+    print(f"\n{'='*80}")
+    print(f"Experiment: {exp_name}")
+    print(f"  Model: {model_type}, Input: {input_mode}")
+    print(f"{'='*80}")
+
+    set_seed(SEED)
+
+    # 실험 폴더 생성
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    exp_dir = os.path.join(OUTPUT_PATH, f'{exp_name}_{timestamp}')
+    os.makedirs(exp_dir, exist_ok=True)
+    os.makedirs(os.path.join(exp_dir, 'best_weights'), exist_ok=True)
+
+    # 데이터 로드 및 Dataset 생성 (input_mode에 따라 다른 Dataset 사용)
+    train_data = data_dict[input_mode]['train']
+    valid_data = data_dict[input_mode]['valid']
+    test_data = data_dict[input_mode]['test']
+
+    if input_mode == 'opt1':
+        # opt1: 1D ECG (1, L) + 7-dim RR features
+        train_dataset = ECGDataset_opt1(*train_data)
+        valid_dataset = ECGDataset_opt1(*valid_data)
+        test_dataset = ECGDataset_opt1(*test_data)
+        n_rr = MODEL_CONFIG['n_rr_opt1']  # 7
+    else:  # opt3
+        # opt3: DAEAC 스타일 3채널 (1, 3, L) + 2-dim RR features
+        train_dataset = ECGDataset_opt3(*train_data)
+        valid_dataset = ECGDataset_opt3(*valid_data)
+        test_dataset = ECGDataset_opt3(*test_data)
+        n_rr = MODEL_CONFIG['n_rr_opt3']  # 2
+
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
+    valid_loader = DataLoader(valid_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
+
+    print(f"  Train: {len(train_dataset):,} | Valid: {len(valid_dataset):,} | Test: {len(test_dataset):,}")
+
+    # 모델 생성 (input_mode에 따라 다른 n_rr 사용)
+    model_config = {
+        'in_channels': MODEL_CONFIG['in_channels'],
+        'out_ch': MODEL_CONFIG['out_ch'],
+        'mid_ch': MODEL_CONFIG['mid_ch'],
+        'num_heads': MODEL_CONFIG['num_heads'],
+        'n_rr': n_rr,
+    }
+    if input_mode == 'opt3':
+        model_config['n_channels_opt3'] = MODEL_CONFIG['n_channels_opt3']  # 3
+
+    model = get_resu_model(
+        model_type=model_type,
+        input_mode=input_mode,
+        nOUT=len(CLASSES),
+        **model_config
+    ).to(device)
+
+    # 학습 설정
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.5)
+
+    # Best 모델 추적
+    initial_state = copy.deepcopy(model.state_dict())
+    best = {
+        'auroc': {'value': -float('inf'), 'epoch': 0, 'state_dict': initial_state, 'valid_metrics': None},
+        'auprc': {'value': -float('inf'), 'epoch': 0, 'state_dict': initial_state, 'valid_metrics': None},
+        'last': {'epoch': EPOCHS, 'state_dict': initial_state, 'valid_metrics': None}
+    }
+
+    # 학습 루프
+    for epoch in range(1, EPOCHS + 1):
+        train_metrics = train_one_epoch(model, train_loader, optimizer, device)
+        valid_metrics, _, _, _ = validate(model, valid_loader, device)
+
+        # Best 체크
+        if valid_metrics['macro_auroc'] > best['auroc']['value']:
+            best['auroc'] = {
+                'value': valid_metrics['macro_auroc'],
+                'epoch': epoch,
+                'state_dict': copy.deepcopy(model.state_dict()),
+                'valid_metrics': copy.deepcopy(valid_metrics)
+            }
+
+        if valid_metrics['macro_auprc'] > best['auprc']['value']:
+            best['auprc'] = {
+                'value': valid_metrics['macro_auprc'],
+                'epoch': epoch,
+                'state_dict': copy.deepcopy(model.state_dict()),
+                'valid_metrics': copy.deepcopy(valid_metrics)
+            }
+
+        if epoch == EPOCHS:
+            best['last'] = {
+                'epoch': epoch,
+                'state_dict': copy.deepcopy(model.state_dict()),
+                'valid_metrics': copy.deepcopy(valid_metrics)
+            }
+
+        scheduler.step()
+
+        if epoch % 10 == 0 or epoch == 1:
+            print(f"  Epoch {epoch:3d} | Train Loss: {train_metrics['loss']:.4f} Acc: {train_metrics['acc']:.4f} | "
+                  f"Valid Acc: {valid_metrics['acc']:.4f} AUROC: {valid_metrics['macro_auroc']:.4f} AUPRC: {valid_metrics['macro_auprc']:.4f}")
+
+    # 테스트
+    print(f"\n--- Testing Best Models ---")
+    results_dict = {}
+
+    for model_key in ['auroc', 'auprc', 'last']:
+        epoch = best[model_key]['epoch']
+        print(f"\n  [{model_key.upper()}] Epoch {epoch}")
+
+        model.load_state_dict(best[model_key]['state_dict'])
+        _, t_preds, t_labels, t_probs = validate(model, test_loader, device)
+        test_metrics = calculate_test_metrics(t_labels, t_preds, t_probs, CLASSES)
+
+        results_dict[model_key] = {
+            'best_epoch': epoch,
+            'valid_metrics': best[model_key]['valid_metrics'],
+            'test_metrics': test_metrics
+        }
+
+        print(f"    Accuracy: {test_metrics['accuracy']:.4f}")
+        print(f"    Macro AUROC: {test_metrics['macro_auroc']:.4f}")
+        print(f"    Macro AUPRC: {test_metrics['macro_auprc']:.4f}")
+        print(f"    Per-class Recall: {dict(zip(CLASSES, test_metrics['per_class_recall'].round(4)))}")
+
+    # Best weights 저장
+    for model_key in ['auroc', 'auprc', 'last']:
+        torch.save({
+            'model_state_dict': best[model_key]['state_dict'],
+            'epoch': best[model_key]['epoch'],
+        }, os.path.join(exp_dir, 'best_weights', f'best_{model_key}.pth'))
+
+    print(f"\n  Results saved to: {exp_dir}")
+
+    return results_dict, exp_dir
+
+
+# =============================================================================
+# 메인 실행
+# =============================================================================
+if __name__ == '__main__':
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    print("=" * 80)
+    print("ResU Automated Experiments")
+    print("=" * 80)
+    print(f"Device: {device}")
+    if torch.cuda.is_available():
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"Output: {OUTPUT_PATH}")
+    print("=" * 80)
+
+    os.makedirs(OUTPUT_PATH, exist_ok=True)
+
+    # 데이터 로드
+    print("\n[1/2] Loading Data...")
+    data_dict = {}
+
+    # opt1 데이터
+    print("\n  Loading opt1 (1D) data...")
+    train_opt1 = extract_data_opt1(DS1_TRAIN, DATA_PATH, OUT_LEN, "Train")
+    valid_opt1 = extract_data_opt1(DS1_VALID, DATA_PATH, OUT_LEN, "Valid")
+    test_opt1 = extract_data_opt1(DS2_TEST, DATA_PATH, OUT_LEN, "Test")
+    data_dict['opt1'] = {'train': train_opt1, 'valid': valid_opt1, 'test': test_opt1}
+
+    # opt3 데이터 (DAEAC 스타일: ECG + RR ratios as 3 channels)
+    print("\n  Loading opt3 (DAEAC style 3-channel) data...")
+    train_opt3 = extract_data_opt3(DS1_TRAIN, DATA_PATH, OUT_LEN, "Train")
+    valid_opt3 = extract_data_opt3(DS1_VALID, DATA_PATH, OUT_LEN, "Valid")
+    test_opt3 = extract_data_opt3(DS2_TEST, DATA_PATH, OUT_LEN, "Test")
+    data_dict['opt3'] = {'train': train_opt3, 'valid': valid_opt3, 'test': test_opt3}
 
     # 실험 실행
-    all_results = []
-    total_start = time.time()
+    print(f"\n[2/2] Running {len(EXPERIMENTS)} experiments...")
+    all_results = {}
 
-    for i, (exp_config, exp_name) in enumerate(experiments, 1):
-        print(f"\n[{i}/{len(experiments)}] {exp_name}")
+    for idx, (exp_name, model_type, input_mode) in enumerate(EXPERIMENTS):
+        print(f"\n[{idx+1}/{len(EXPERIMENTS)}] {exp_name}")
 
         try:
-            result = run_single_experiment(exp_config, exp_name, data_loaders, device)
-            all_results.append(result)
-
-            # 실험 완료 즉시 엑셀에 기록
-            if result['status'] == 'success' and 'full_metrics' in result:
-                for metric_name in ["macro_auprc", "macro_auroc", "macro_recall", "macro_f1"]:
-                    if metric_name in result['full_metrics']:
-                        metrics = result['full_metrics'][metric_name]
-                        short_name = metric_name.replace("macro_", "")
-
-                        if excel_writer:
-                            excel_writer.write_metrics(exp_name, metrics, short_name)
-                            if 'confusion_matrix' in metrics:
-                                excel_writer.write_confusion_matrix(exp_name, metrics['confusion_matrix'], short_name)
-
-                        if cumulative_writer:
-                            cumulative_writer.append_result(exp_name, metrics, exp_config, short_name)
-                            if 'confusion_matrix' in metrics:
-                                cumulative_writer.append_confusion_matrix(exp_name, metrics['confusion_matrix'], short_name)
-
-                print(f"  [Excel] Results saved for {exp_name}")
-
+            results_dict, exp_dir = run_experiment(exp_name, model_type, input_mode, data_dict, device)
+            all_results[exp_name] = results_dict
         except Exception as e:
             print(f"  ERROR: {e}")
-            all_results.append({
-                'exp_name': exp_name,
-                'config': exp_config,
-                'status': 'error',
-                'error': str(e)
-            })
+            import traceback
+            traceback.print_exc()
 
     # 결과 요약
-    total_time = (time.time() - total_start) / 60
+    print("\n" + "=" * 80)
+    print("EXPERIMENT SUMMARY")
+    print("=" * 80)
+    print(f"\n{'Experiment':<25} {'Acc':>8} {'AUROC':>8} {'AUPRC':>8}")
+    print("-" * 53)
 
-    print(f"\n{'='*60}")
-    print("[3/3] EXPERIMENT SUMMARY")
-    print(f"{'='*60}")
-    print(f"Total time: {total_time:.1f} min")
-    print(f"Results saved to: {OUTPUT_DIR}")
+    for exp_name, results in all_results.items():
+        if 'auroc' in results:
+            m = results['auroc']['test_metrics']
+            print(f"{exp_name:<25} {m['accuracy']:>8.4f} {m['macro_auroc']:>8.4f} {m['macro_auprc']:>8.4f}")
 
-    print(f"\n{'Experiment':<20} {'Acc':>8} {'F1':>8} {'AUPRC':>8} {'AUROC':>8}")
-    print("-" * 56)
-
-    for result in all_results:
-        if result['status'] == 'success':
-            r = result['test_macro_auprc']  # Best AUPRC 모델 결과
-            print(f"{result['exp_name']:<20} {r['acc']:>8.4f} {r['macro_f1']:>8.4f} "
-                  f"{r['macro_auprc']:>8.4f} {r['macro_auroc']:>8.4f}")
-        else:
-            print(f"{result['exp_name']:<20} FAILED")
-
-    # 최종 요약 출력
-    if excel_writer:
-        print(f"\nExcel results saved to: {os.path.join(OUTPUT_DIR, 'autoexp_results.xlsx')}")
-    if cumulative_writer:
-        print(f"\nCumulative results saved to: ./cumulative_results.xlsx")
-        print(f"[CumulativeExcel] Final record count: {cumulative_writer.get_record_count()}")
-
-
-if __name__ == '__main__':
-    main()
+    print("\n" + "=" * 80)
+    print("ALL EXPERIMENTS COMPLETED!")
+    print("=" * 80)
