@@ -102,8 +102,8 @@ def run_single_experiment(exp_config: dict, exp_name: str, loader_key: str, data
     # 결과 평가
     results = {'exp_name': exp_name, 'config': exp_config, 'status': 'success', 'full_metrics': {}}
     
-    # 저장된 모델 로드 (config.py에 macro_f1이 없다면 auprc, auroc만 로드)
-    target_metrics = ["macro_auprc", "macro_auroc"]
+    # 저장된 모델 로드
+    target_metrics = ["macro_auprc", "macro_auroc", "macro_f1"]
     
     for metric in target_metrics:
         if trainer.load_best_model(metric):
@@ -209,10 +209,29 @@ def main():
                         excel_writer.write_confusion_matrix(exp_name, metrics['confusion_matrix'], "auprc")
                 print(f" -> {exp_name}: Acc={metrics['acc']:.4f}, F1={metrics['macro_f1']:.4f}, AUPRC={metrics['macro_auprc']:.4f}")
 
-                # Confusion Matrix 출력
+                # Confusion Matrix 출력 (AUPRC)
                 if 'confusion_matrix' in metrics:
                     print(f"\n[{exp_name}] Confusion Matrix (Best AUPRC model):")
                     print(metrics['confusion_matrix'])
+
+            # AUROC 기준 Confusion Matrix 출력
+            if 'test_macro_auroc' in res:
+                metrics_auroc = res['full_metrics']['macro_auroc']
+                if 'confusion_matrix' in metrics_auroc:
+                    print(f"\n[{exp_name}] Confusion Matrix (Best AUROC model):")
+                    print(metrics_auroc['confusion_matrix'])
+
+            # F1 기준 결과 출력
+            if 'test_macro_f1' in res:
+                metrics_f1 = res['full_metrics']['macro_f1']
+                if excel_writer:
+                    excel_writer.write_metrics(exp_name, metrics_f1, "f1")
+                    if 'confusion_matrix' in metrics_f1:
+                        excel_writer.write_confusion_matrix(exp_name, metrics_f1['confusion_matrix'], "f1")
+                print(f" -> {exp_name} (Best F1): Acc={metrics_f1['acc']:.4f}, F1={metrics_f1['macro_f1']:.4f}, AUPRC={metrics_f1['macro_auprc']:.4f}")
+                if 'confusion_matrix' in metrics_f1:
+                    print(f"\n[{exp_name}] Confusion Matrix (Best F1 model):")
+                    print(metrics_f1['confusion_matrix'])
         except Exception as e:
             print(f"ERROR in {exp_name}: {e}")
             import traceback

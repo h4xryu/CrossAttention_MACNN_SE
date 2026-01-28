@@ -35,8 +35,8 @@ from utils import set_seed, load_or_extract_data
 # 실험할 파라미터 그리드
 EXPERIMENT_GRID = {
     # Fusion type 실험 (opt1, lead=1일 때만 의미있음)
-    # "fusion_type": ["mhca"],
-    "fusion_type": [None],
+    "fusion_type": ["concat_proj", "concat", "mhca",None],
+    # "fusion_type": [None],
 
     # MHCA용 num_heads (fusion_type="mhca"일 때만 사용)
     "fusion_num_heads": [1],
@@ -52,7 +52,7 @@ FUSION_EXP_CONFIG = {
 
 
 # 실험별 epochs (빠른 실험용)
-EXP_EPOCHS = 50
+EXP_EPOCHS = 100
 
 # 결과 저장 경로
 OUTPUT_DIR = "./autoexp_results_202602/"
@@ -170,7 +170,7 @@ def run_single_experiment(exp_config: dict, exp_name: str, data_loaders: dict, d
         'full_metrics': {},  # 엑셀 저장용 전체 metrics
     }
 
-    for metric in ["macro_auprc", "macro_auroc", "macro_recall"]:
+    for metric in ["macro_auprc", "macro_auroc", "macro_recall", "macro_f1"]:
         trainer.load_best_model(metric)
         test_metrics = trainer.evaluate(test_loader)
         results[f"test_{metric}"] = {
@@ -401,7 +401,7 @@ def main():
 
             # 실험 완료 즉시 엑셀에 기록
             if result['status'] == 'success' and 'full_metrics' in result:
-                for metric_name in ["macro_auprc", "macro_auroc", "macro_recall"]:
+                for metric_name in ["macro_auprc", "macro_auroc", "macro_recall", "macro_f1"]:
                     if metric_name in result['full_metrics']:
                         metrics = result['full_metrics'][metric_name]
                         short_name = metric_name.replace("macro_", "")

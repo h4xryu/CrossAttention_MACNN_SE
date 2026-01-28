@@ -164,6 +164,113 @@ def compute_rr_features_opt1(ecg_signal: np.ndarray, r_peaks: np.ndarray, fs: in
     return all_features
 
 
+def compute_rr_features_opt1_old(ecg_signal: np.ndarray, r_peaks: np.ndarray, fs: int = 360) -> np.ndarray:
+
+    """기존 실험용 RR features (7 features)"""
+
+    n_beats = len(r_peaks)
+
+    ms_factor = 1000.0 / fs
+
+
+
+    pre_rr = np.zeros(n_beats, dtype=np.float32)
+
+    post_rr = np.zeros(n_beats, dtype=np.float32)
+
+    local_rr = np.zeros(n_beats, dtype=np.float32)
+
+
+
+    for i in range(n_beats):
+
+        if i > 0:
+
+            pre_rr[i] = (r_peaks[i] - r_peaks[i-1]) * ms_factor
+
+        else:
+
+            if n_beats > 1:
+
+                pre_rr[i] = (r_peaks[1] - r_peaks[0]) * ms_factor
+
+            else:
+
+                pre_rr[i] = 800.0
+
+
+
+        if i < n_beats - 1:
+
+            post_rr[i] = (r_peaks[i+1] - r_peaks[i]) * ms_factor
+
+        else:
+
+            if n_beats > 1:
+
+                post_rr[i] = (r_peaks[-1] - r_peaks[-2]) * ms_factor
+
+            else:
+
+                post_rr[i] = 800.0
+
+
+
+    for i in range(n_beats):
+
+        start_idx = max(0, i - 9)
+
+        window = pre_rr[start_idx:i+1]
+
+        if len(window) > 0:
+
+            local_rr[i] = np.mean(window)
+
+        else:
+
+            local_rr[i] = pre_rr[i]
+
+
+
+    valid_pre_rr = pre_rr[pre_rr > 50]
+
+    if len(valid_pre_rr) > 1:
+
+        global_rr_mean = np.mean(valid_pre_rr)
+
+    else:
+
+        global_rr_mean = 800.0
+
+
+
+    global_rr = np.full(n_beats, global_rr_mean, dtype=np.float32)
+
+
+
+    epsilon = 1.0
+
+    pre_div_post = pre_rr / np.maximum(post_rr, epsilon)
+
+    pre_minus_global = pre_rr - global_rr
+
+    pre_div_global = pre_rr / np.maximum(global_rr, epsilon)
+
+
+
+    all_features = np.stack([
+
+        pre_rr, post_rr, local_rr, pre_div_post,
+
+        global_rr, pre_minus_global, pre_div_global
+
+    ], axis=1).astype(np.float32)
+
+
+
+    return all_features
+
+
 def compute_rr_features_opt2(ecg_signal: np.ndarray, r_peaks: np.ndarray, fs: int = 360) -> np.ndarray:
     """DAEAC 논문 방식의 RR Feature 추출 (2 features)"""
     n_beats = len(r_peaks)

@@ -225,10 +225,17 @@ def main():
                         excel_writer.write_confusion_matrix(exp_name, metrics['confusion_matrix'], "auprc")
                 print(f" -> {exp_name}: Acc={metrics['acc']:.4f}, F1={metrics['macro_f1']:.4f}, AUPRC={metrics['macro_auprc']:.4f}")
 
-                # Confusion Matrix 출력
+                # Confusion Matrix 출력 (AUPRC)
                 if 'confusion_matrix' in metrics:
                     print(f"\n[{exp_name}] Confusion Matrix (Best AUPRC model):")
                     print(metrics['confusion_matrix'])
+
+            # AUROC 기준 Confusion Matrix 출력
+            if 'test_macro_auroc' in res:
+                metrics_auroc = res['full_metrics']['macro_auroc']
+                if 'confusion_matrix' in metrics_auroc:
+                    print(f"\n[{exp_name}] Confusion Matrix (Best AUROC model):")
+                    print(metrics_auroc['confusion_matrix'])
                 
         except Exception as e:
             print(f"ERROR in {exp_name}: {e}")

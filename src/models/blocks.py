@@ -492,8 +492,8 @@ class MultiHeadCrossAttentionFusion(nn.Module):
         # ------------------------------------------------------------
         # Channel-wise Gate scaling
         # ------------------------------------------------------------
-        gate = torch.sigmoid(self.alpha)  # (emb_dim,)
-        attn_out = attn_out * gate.unsqueeze(0)  # (B,emb)
+        # gate = torch.sigmoid(self.alpha)  # (emb_dim,)
+        # attn_out = attn_out * gate.unsqueeze(0)  # (B,emb)
 
         # ------------------------------------------------------------
         # Final Fusion (Concat 유지)
