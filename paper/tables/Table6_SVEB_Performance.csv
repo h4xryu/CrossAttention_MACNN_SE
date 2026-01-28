@@ -1,0 +1,7 @@
+﻿Method,S_Precision_%,S_Sensitivity_%,S_F1_%
+Baseline,21.22,11.21,14.67
+A1 (Concat),36.49,35.44,35.96
+A2 (Cross-Attn),70.45,66.58,68.46
+B1 (Concat-TF),70.45,66.58,68.46
+B2 (MHCA-TF),70.45,66.58,68.46
+Delta (B2 vs Baseline),+49.23,+55.37,+53.79

@@ -1,0 +1,6 @@
+﻿Method,Fusion_Type,Input_Option,Macro_Acc_%,Macro_Se_%,Macro_Sp_%,Macro_Pr_%,Macro_F1_%
+Baseline (opt2),Early (DAEAC),opt2,96.18,40.71,86.43,52.13,43.19
+Naive Concat (opt1),Late Concat,opt1,93.22,47.56,86.13,51.16,43.84
+Proj Concat (opt1),Late + Gate,opt1,96.74,42.37,85.42,55.61,44.53
+MHCA h=1 (opt1),Cross-Attention,opt1,92.48,43.28,86.16,49.95,45.41
+Hybrid MHCA (opt3),Early + Cross-Attention,opt3,93.74,70.83,94.33,56.41,58.54

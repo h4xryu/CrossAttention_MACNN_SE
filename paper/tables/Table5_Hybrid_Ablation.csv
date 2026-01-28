@@ -1,0 +1,5 @@
+﻿Configuration,Early_Fusion,Late_MHCA,Macro_Se_%,Macro_F1_%,Delta_Se_%p,Delta_F1_%p
+Baseline,Yes,No,40.71,43.19,-,-
+MHCA only,No,Yes,43.28,45.41,+2.57,+2.22
+Early only,Yes,No,40.71,43.19,+0.00,+0.00
+Hybrid (Early + MHCA),Yes,Yes,70.83,58.54,+30.12,+15.35

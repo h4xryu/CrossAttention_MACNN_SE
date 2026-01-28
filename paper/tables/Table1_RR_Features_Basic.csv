@@ -1,0 +1,8 @@
+﻿Feature,Formula,설명,opt1_index,opt2_index
+Pre-RR,RR_{i-1},직전 RR 간격,-,0 (ratio)
+Post-RR,RR_i,직후 RR 간격,-,1 (ratio)
+Local-RR,μ_l (최근 10개 평균),최근 10개 RR 평균,-,-
+Global-RR,μ_g (전역 평균),전역 RR 평균,-,-
+Pre-Global diff,RR_{i-1} - μ_g,전역 평균 대비 편차,-,-
+Post-Global ratio,RR_{i-1} / μ_g,전역 평균 대비 비율,-,-
+Pre-Post ratio,RR_{i-1} / RR_i,Pre/Post 비율,-,-

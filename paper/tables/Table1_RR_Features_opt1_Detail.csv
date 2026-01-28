@@ -1,0 +1,8 @@
+﻿Index,Feature_Name,Formula,역할,중요도
+0,Pre/Local,Pre_RR / Local_RR,조기성 감지 (SVEB 핵심),핵심
+1,Pre/Post,Pre_RR / Post_RR,보상 휴지기 확인,핵심
+2,Pre/Prev(t-1),Pre_RR[i] / Pre_RR[i-1],급격한 변화 감지 (t-1),핵심
+3,Post/Local,Post_RR / Local_RR,회복 후 리듬 확인,핵심
+4,Local/Global,Local_RR / Global_RR,환자 평소 대비 현재 상태,보조
+5,Pre/Pre(t-2),Pre_RR[i] / Pre_RR[i-2],급격한 변화 감지 (t-2),보조
+6,Post/Next_Post,Post_RR[i] / Post_RR[i+1],회복 안정성,보조
