@@ -23,17 +23,18 @@ from sklearn.metrics import (
     roc_auc_score, average_precision_score
 )
 
-# ResU 모델 import
-sys.path.append('./src/models')
+# ResU 모델 import (스크립트 위치 기준 절대 경로)
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(os.path.join(SCRIPT_DIR, 'src', 'models'))
 from ResU import get_resu_model
 
 # =============================================================================
 # 설정
 # =============================================================================
 
-DATA_PATH = './data/mit-bih-arrhythmia-database-1.0.0/'
-OUTPUT_PATH = './auto_results_ResU/'
-CACHE_DIR = './dataset_cache_ResU/'
+DATA_PATH = os.path.join(SCRIPT_DIR, 'data', 'mit-bih-arrhythmia-database-1.0.0')
+OUTPUT_PATH = os.path.join(SCRIPT_DIR, 'auto_results_ResU')
+CACHE_DIR = os.path.join(SCRIPT_DIR, 'dataset_cache_ResU')
 
 BATCH_SIZE = 1024
 EPOCHS = 75
